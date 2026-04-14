@@ -29,7 +29,7 @@ end
 
 local sess, err = pwdebug.new({
   stub_path    = stub_abs,
-  breakpoints  = { "demo.lua:4" },
+  breakpoints  = { "demo.lua:7" },
   source_roots = { here },
   on_status    = function(msg)
     io.stderr:write("[pwdebug] " .. msg .. "\n")

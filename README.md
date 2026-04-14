@@ -11,6 +11,8 @@ side and LuaJIT FFI on the controller side.
 - **`pwdebug.lua`** — LuaJIT-only controller library. Creates the
   FIFOs, spawns the debugged child with the right env vars, decodes
   events, sends commands.
+- **`bin/pwdebug`** — a simple interactive CLI built on the library.
+  Run it like `gdb`: `pwdebug -b foo.lua:42 foo.lua`.
 
 What you get:
 
@@ -59,23 +61,71 @@ controller; `pwdebug_stub.lua` is passed as an absolute path via
 
 ## Quickstart
 
-Say this is the program you want to debug:
+Say this is the program you want to debug (`examples/demo.lua`):
 
 ```lua
--- examples/demo.lua
+-- demo.lua — target program for the pwdebug quickstart.
+-- Try: bin/pwdebug -b demo.lua:7 examples/demo.lua
+
 local function greet(name, times)
-  local message = "hello, " .. name
+  local message = "hello, " .. name   -- line 5
   for i = 1, times do
-    print(message .. " (" .. i .. ")")
+    print(message .. " (" .. i .. ")")  -- line 7
   end
 end
 
 greet("world", 3)
 ```
 
-Here's the minimum controller that sets a breakpoint at line 4,
-prints the stack + locals whenever it fires, and continues. This is
-`examples/mini_controller.lua`:
+### Quickest way: the `pwdebug` CLI
+
+A simple interactive debugger ships in `bin/pwdebug`. Run it like
+`gdb`:
+
+```sh
+bin/pwdebug -b demo.lua:7 examples/demo.lua
+```
+
+It spawns the target, waits for the breakpoint, drops you into a
+REPL each time it fires:
+
+```
+pwdebug: launching: lua5.1 examples/demo.lua
+pwdebug:   breakpoint: demo.lua:7
+pwdebug: waiting for events (Ctrl-C to quit)
+pwdebug: child attached
+
+*** BREAK at examples/demo.lua:7  [main]  (reason=stop)
+* #1  greet                    examples/demo.lua:7
+  #2  <main>                   examples/demo.lua:11
+  #3  [C]                      =[C]:-1
+
+locals:
+  name = "world"
+  times = 3
+  message = "hello, world"
+  i = 1
+(pwdebug) p message
+local message = "hello, world"
+(pwdebug) c
+
+*** BREAK at examples/demo.lua:7  ...
+(pwdebug) c
+...
+```
+
+Commands: `c`/`s`/`n`/`f` (continue/step/next/finish), `bt` (stack),
+`l [N]` (source around the current line), `locals`, `p NAME` (deep
+inspect a variable), `frame N` (select frame), `b FILE:L[!]` /
+`d FILE:L` (add/remove breakpoint), `bps` (list breakpoints), `q`.
+Type `help` for the full list. Run `pwdebug --help` for CLI options.
+
+### Build your own: the library API
+
+You don't need to use the CLI — it's just ~300 lines of Lua calling
+the library. Here's the minimum controller that does roughly the
+same thing, so you can see the full loop in one place
+(`examples/mini_controller.lua`):
 
 ```lua
 #!/usr/bin/env luajit

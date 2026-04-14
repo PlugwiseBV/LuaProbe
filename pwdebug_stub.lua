@@ -90,12 +90,19 @@ for item in bps_env:gmatch("[^,]+") do
   if item ~= "" then add_bp(item) end
 end
 
--- Gap (in lines) we're willing to tolerate when snapping in a main
--- chunk. Main chunks have `linedefined = 0` in Lua 5.1 so we can't
--- use the linedefined/lastlinedefined range check; we fall back to
--- a small proximity window to prevent snapping across the entire
--- module at load time.
-local MAIN_CHUNK_SNAP_WINDOW = 5
+-- In main chunks, snapping is disabled entirely: the requested line
+-- must be an executable line of the main chunk exactly, otherwise
+-- the breakpoint won't fire from main-chunk code.
+--
+-- Why: Lua 5.1 fires a line hook at the `end` of a `local function
+-- foo() ... end` statement *at definition time*, as part of the main
+-- chunk's execution. Any non-zero snap window in main chunks lets
+-- that false hit win against the real (eventual) hit inside the
+-- function body, and the user ends up paused on an `end` line with
+-- an empty locals table. Function-body breakpoints still snap via
+-- the `linedefined/lastlinedefined` range check, which is what
+-- 99% of real breakpoints need anyway.
+local MAIN_CHUNK_SNAP_WINDOW = 0
 
 -- Walk bp_list on every hit. `info` is the raw `debug.getinfo(2, "S")`
 -- result from the hook — needed for scope-aware snapping so we don't

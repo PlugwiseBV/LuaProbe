@@ -1,0 +1,478 @@
+#!/usr/bin/env luajit
+-- pwdebug — simple interactive command-line debugger for Lua 5.1 /
+-- LuaJIT programs. Wraps the pwdebug library with a plain REPL; no
+-- curses, no ncurses, just stdout and io.read.
+--
+-- Usage:
+--   pwdebug [options] <target.lua> [target_args...]
+--
+-- Options:
+--   -b, --break FILE:LINE[!]   set a breakpoint (repeatable); trailing
+--                              ! makes it log-only (print and continue)
+--   -s, --source DIR           search this dir when resolving source
+--                              files for display (repeatable, default .)
+--   -i, --interp CMD           interpreter to run the target with
+--                              (default: lua5.1)
+--       --stub PATH            override path to pwdebug_stub.lua
+--   -h, --help                 this message
+--
+-- When a stop breakpoint fires, pwdebug drops you into a REPL. The
+-- most useful commands are:
+--
+--   c          continue
+--   s          step into next line
+--   n          step over (same thread/frame)
+--   f          finish (run until current function returns)
+--   bt         backtrace (stack)
+--   l [N]      list source around the current line (default 10 lines)
+--   locals     list locals + upvalues of the current frame
+--   p NAME     deep-inspect a local or upvalue by name (prints the
+--              full recursive dump the stub produces)
+--   frame N    select frame index N (1 = top)
+--   b FILE:L[!]  add a breakpoint at runtime
+--   d FILE:L   delete a breakpoint at runtime
+--   bps        list breakpoints
+--   q          quit (kills the target)
+--   help       command list
+--
+-- Target stdout/stderr interleaves with this REPL on the same tty.
+-- For a cleaner experience, redirect the target's output:
+--
+--   pwdebug -b foo.lua:42 foo.lua 2>/tmp/target.err >/tmp/target.out
+
+-- Find the repo's pwdebug.lua regardless of where we're invoked from.
+local this_script = arg[0]
+local repo_dir = this_script:match("(.*/)")
+if not repo_dir or repo_dir == "" then repo_dir = "./" end
+-- bin/pwdebug -> repo/
+package.path = repo_dir .. "../?.lua;" .. repo_dir .. "?.lua;" .. package.path
+
+-- Force line-buffered stdout/stderr so our prompts and status lines
+-- actually appear under a pipe, not just when buffers eventually flush.
+pcall(function() io.stdout:setvbuf("line") end)
+pcall(function() io.stderr:setvbuf("line") end)
+
+local ok_mod, pwdebug = pcall(require, "pwdebug")
+if not ok_mod then
+  io.stderr:write("pwdebug: could not load pwdebug.lua (" .. tostring(pwdebug) .. ")\n")
+  io.stderr:write("  looked in: " .. package.path .. "\n")
+  os.exit(1)
+end
+
+-- ---------- arg parsing ----------
+
+local function print_help()
+  -- Re-print the header comment block verbatim.
+  local f = io.open(this_script, "r")
+  if not f then return end
+  for line in f:lines() do
+    if line:sub(1, 2) == "--" then
+      if line == "--" then
+        print("")
+      else
+        print(line:sub(4))  -- strip "-- "
+      end
+    elseif line ~= "" and line:sub(1, 1) ~= "#" then
+      break
+    end
+  end
+  f:close()
+end
+
+local opts = {
+  breakpoints = {},
+  source_dirs = {},
+  interp      = "lua5.1",
+  stub_path   = nil,
+  target      = nil,
+  target_args = {},
+}
+
+do
+  local i = 1
+  while arg[i] do
+    local a = arg[i]
+    if a == "-b" or a == "--break" then
+      i = i + 1
+      if not arg[i] then
+        io.stderr:write("pwdebug: --break needs an argument\n")
+        os.exit(2)
+      end
+      opts.breakpoints[#opts.breakpoints + 1] = arg[i]
+    elseif a == "-s" or a == "--source" then
+      i = i + 1
+      if not arg[i] then
+        io.stderr:write("pwdebug: --source needs an argument\n")
+        os.exit(2)
+      end
+      opts.source_dirs[#opts.source_dirs + 1] = arg[i]
+    elseif a == "-i" or a == "--interp" then
+      i = i + 1
+      opts.interp = arg[i]
+    elseif a == "--stub" then
+      i = i + 1
+      opts.stub_path = arg[i]
+    elseif a == "-h" or a == "--help" then
+      print_help()
+      os.exit(0)
+    elseif a:sub(1, 1) == "-" then
+      io.stderr:write("pwdebug: unknown option " .. a .. "\n")
+      os.exit(2)
+    else
+      -- First positional is the target script; rest go to the target.
+      opts.target = a
+      i = i + 1
+      while arg[i] do
+        opts.target_args[#opts.target_args + 1] = arg[i]
+        i = i + 1
+      end
+      break
+    end
+    i = i + 1
+  end
+end
+
+if not opts.target then
+  io.stderr:write("pwdebug: missing target script\n")
+  io.stderr:write("run `pwdebug --help` for usage\n")
+  os.exit(2)
+end
+if #opts.source_dirs == 0 then
+  opts.source_dirs[1] = "."
+end
+
+-- Resolve stub path to absolute. LUA_INIT needs absolute paths.
+local function abspath(p)
+  local f = io.popen("realpath '" .. p:gsub("'", "'\\''") .. "' 2>/dev/null")
+  local out = f and f:read("*l")
+  if f then f:close() end
+  return (out and out ~= "") and out or nil
+end
+
+local stub_abs = opts.stub_path and abspath(opts.stub_path)
+               or abspath(repo_dir .. "../pwdebug_stub.lua")
+               or abspath(repo_dir .. "pwdebug_stub.lua")
+if not stub_abs then
+  io.stderr:write("pwdebug: could not resolve stub path; use --stub PATH\n")
+  os.exit(1)
+end
+
+-- ---------- start session ----------
+
+local sess, err = pwdebug.new({
+  stub_path    = stub_abs,
+  breakpoints  = opts.breakpoints,
+  source_roots = opts.source_dirs,
+  on_status    = function(msg)
+    io.stderr:write("[pwdebug] " .. msg .. "\n")
+  end,
+})
+if not sess then
+  io.stderr:write("pwdebug: could not create session: " .. tostring(err) .. "\n")
+  os.exit(1)
+end
+
+-- Shell-escape a single string for safe embedding inside sh -c '...'.
+local function shq(s)
+  return "'" .. s:gsub("'", [['\'']]) .. "'"
+end
+
+-- Build the child command: env prefix + interpreter + target + target args.
+local target_args_str = ""
+for _, a in ipairs(opts.target_args) do
+  target_args_str = target_args_str .. " " .. shq(a)
+end
+local cmd = string.format(
+  "sh -c '%s %s %s%s' &",
+  sess:env_prefix(), opts.interp, shq(opts.target), target_args_str)
+
+io.write("pwdebug: launching: " .. opts.interp .. " " .. opts.target .. "\n")
+for _, spec in ipairs(opts.breakpoints) do
+  io.write("pwdebug:   breakpoint: " .. spec .. "\n")
+end
+io.write("pwdebug: waiting for events (Ctrl-C to quit)\n")
+os.execute(cmd)
+
+-- Trap Ctrl-C so we can clean up FIFOs on exit. Best-effort: LuaJIT
+-- doesn't expose signal(3) directly without ffi, so we just install
+-- a fallback via pcall around the main loop.
+
+-- ---------- REPL helpers ----------
+
+local current_frame_idx = 1
+
+local function print_location(ev)
+  local f = ev.frames and ev.frames[current_frame_idx]
+  local src = (f and f.source) or "?"
+  local line = (f and f.line) or ev.line or 0
+  local thread_tag = ev.is_main and "main"
+                   or ("co:" .. tostring(ev.thread or ""):sub(-8))
+  local reason = ev.reason or "?"
+  io.write(string.format(
+    "\n*** BREAK at %s:%d  [%s]  (reason=%s)\n",
+    src, line, thread_tag, reason))
+  if ev.created_src then
+    io.write(string.format("    coroutine created at %s:%d\n",
+      ev.created_src, ev.created_line or 0))
+  end
+end
+
+local function print_backtrace(ev)
+  for i, f in ipairs(ev.frames or {}) do
+    local marker = (i == current_frame_idx) and "* " or "  "
+    io.write(string.format("%s#%d  %-24s %s:%d\n",
+      marker, i, f.name or "?", f.source or "?", f.line or 0))
+  end
+end
+
+local function print_locals(ev)
+  local fv = ev.vars and ev.vars[current_frame_idx]
+  if not fv then
+    io.write("  (no frame selected)\n")
+    return
+  end
+  if fv.locals and #fv.locals > 0 then
+    io.write("locals:\n")
+    for _, v in ipairs(fv.locals) do
+      io.write(string.format("  %s = %s\n", v.name, v.value))
+    end
+  end
+  if fv.upvalues and #fv.upvalues > 0 then
+    io.write("upvalues:\n")
+    for _, v in ipairs(fv.upvalues) do
+      io.write(string.format("  %s = %s\n", v.name, v.value))
+    end
+  end
+  if fv.entry and #fv.entry > 0 then
+    io.write("entry (values at function entry):\n")
+    for _, v in ipairs(fv.entry) do
+      io.write(string.format("  %s = %s\n", v.name, v.value))
+    end
+  end
+end
+
+local function print_source(ev, n)
+  n = tonumber(n) or 10
+  local f = ev.frames and ev.frames[current_frame_idx]
+  if not f or not f.source then
+    io.write("  (no source for current frame)\n")
+    return
+  end
+  local lines = sess:get_source(f.source)
+  if not lines or #lines == 0 then
+    io.write("  (source not available: " .. tostring(f.source) .. ")\n")
+    return
+  end
+  local cur = f.line or 1
+  local half = math.floor(n / 2)
+  local first = math.max(1, cur - half)
+  local last  = math.min(#lines, first + n - 1)
+  for i = first, last do
+    local marker = (i == cur) and "=>" or "  "
+    io.write(string.format("%s %5d  %s\n", marker, i, lines[i]))
+  end
+end
+
+local function print_bps()
+  if #sess.breakpoints == 0 then
+    io.write("  (no breakpoints)\n")
+    return
+  end
+  for _, bp in ipairs(sess.breakpoints) do
+    io.write(string.format("  %s%s:%d\n",
+      bp.log and "[log] " or "[stop] ", bp.path, bp.line))
+  end
+end
+
+local function find_var(fv, name)
+  if not fv then return nil end
+  for _, v in ipairs(fv.locals or {}) do
+    if v.name == name then return "local", v end
+  end
+  for _, v in ipairs(fv.upvalues or {}) do
+    if v.name == name then return "upvalue", v end
+  end
+  return nil
+end
+
+-- Wait synchronously for an event of a given type. Used right after
+-- we send an inspect command; the result comes back async via poll.
+local function wait_for_event(event_name, timeout_ticks)
+  timeout_ticks = timeout_ticks or 200
+  for _ = 1, timeout_ticks do
+    for _, ev in ipairs(sess:poll()) do
+      if ev.event == event_name then return ev end
+    end
+    os.execute("sleep 0.02")
+  end
+  return nil
+end
+
+local HELP = [[
+commands:
+  c, cont      continue execution
+  s, step      step into the next executable line
+  n, next      step over (same thread, stack depth <=)
+  f, finish    step out (run until current function returns)
+  bt, stack    backtrace of the current frames
+  l [N]        list N lines of source around the current frame (default 10)
+  locals       print locals + upvalues + entry values for current frame
+  p NAME       deep-inspect variable NAME (local or upvalue) in current frame
+  frame N      select stack frame N (1 = topmost)
+  b FILE:L[!]  add a breakpoint (! = log-only)
+  d FILE:L     delete a breakpoint
+  bps          list active breakpoints
+  q, quit      quit the debugger (kills the target)
+  h, help      this message
+]]
+
+local current_break_ev = nil
+
+-- Returns true if the REPL should return to polling, false to quit.
+local function handle_command(input)
+  local cmd, rest = input:match("^(%S+)%s*(.*)$")
+  if not cmd then return true end
+  cmd = cmd:lower()
+
+  if cmd == "c" or cmd == "cont" or cmd == "continue" then
+    sess:cmd_continue()
+    return true
+  elseif cmd == "s" or cmd == "step" then
+    sess:cmd_step()
+    return true
+  elseif cmd == "n" or cmd == "next" then
+    sess:cmd_next()
+    return true
+  elseif cmd == "f" or cmd == "finish" then
+    sess:cmd_finish()
+    return true
+  elseif cmd == "bt" or cmd == "stack" or cmd == "where" then
+    print_backtrace(current_break_ev)
+  elseif cmd == "l" or cmd == "list" then
+    print_source(current_break_ev, rest ~= "" and rest or nil)
+  elseif cmd == "locals" then
+    print_locals(current_break_ev)
+  elseif cmd == "p" or cmd == "print" then
+    if rest == "" then
+      io.write("  usage: p <variable-name>\n")
+      return nil
+    end
+    local fv = current_break_ev.vars and current_break_ev.vars[current_frame_idx]
+    local kind, var = find_var(fv, rest)
+    if not kind then
+      io.write("  no local or upvalue named '" .. rest .. "' in frame " ..
+        current_frame_idx .. "\n")
+      return nil
+    end
+    local frame = current_break_ev.frames[current_frame_idx]
+    sess:inspect_var(frame, kind, rest)
+    local reply = wait_for_event("inspect", 250)
+    if reply and reply.repr then
+      io.write(string.format("%s %s = %s\n", kind, rest, reply.repr))
+    else
+      io.write("  (inspect: no reply from stub within timeout)\n")
+    end
+  elseif cmd == "frame" then
+    local n = tonumber(rest)
+    if not n then
+      io.write("  usage: frame <index>  (current is " .. current_frame_idx .. ")\n")
+      return nil
+    end
+    local max = #(current_break_ev.frames or {})
+    if n < 1 or n > max then
+      io.write(string.format("  frame %d out of range (have 1..%d)\n", n, max))
+      return nil
+    end
+    current_frame_idx = n
+    print_location(current_break_ev)
+  elseif cmd == "b" or cmd == "break" then
+    if rest == "" then
+      io.write("  usage: b FILE:LINE[!]\n")
+      return nil
+    end
+    if sess:add_breakpoint(rest) then
+      io.write("  added " .. rest .. "\n")
+    else
+      io.write("  (already set or malformed spec)\n")
+    end
+  elseif cmd == "d" or cmd == "del" or cmd == "delete" then
+    local path, line = rest:match("^(.-):(%d+)$")
+    if not path then
+      io.write("  usage: d FILE:LINE\n")
+      return nil
+    end
+    if sess:remove_breakpoint(path, tonumber(line)) then
+      io.write("  removed " .. rest .. "\n")
+    else
+      io.write("  (no such breakpoint)\n")
+    end
+  elseif cmd == "bps" or cmd == "breakpoints" then
+    print_bps()
+  elseif cmd == "q" or cmd == "quit" or cmd == "exit" then
+    sess:close()
+    os.execute("sleep 0.05")
+    os.exit(0)
+  elseif cmd == "h" or cmd == "help" or cmd == "?" then
+    io.write(HELP)
+  else
+    io.write("  unknown command: " .. cmd .. "  (try 'help')\n")
+  end
+  return nil  -- stay in REPL
+end
+
+local function enter_repl(ev)
+  current_break_ev = ev
+  current_frame_idx = 1
+  print_location(ev)
+  print_backtrace(ev)
+  io.write("\n")
+  print_locals(ev)
+  while true do
+    io.write("(pwdebug) ")
+    io.flush()
+    local input = io.read("*l")
+    if not input then
+      -- stdin closed (Ctrl-D) → continue rather than hang
+      sess:cmd_continue()
+      return
+    end
+    input = input:match("^%s*(.-)%s*$")
+    if input ~= "" then
+      local resume = handle_command(input)
+      if resume == true then return end
+      -- nil = stay in REPL
+    end
+  end
+end
+
+-- ---------- main loop ----------
+
+local running = true
+while running do
+  local evs = sess:poll()
+  for _, ev in ipairs(evs) do
+    if ev.event == "hello" then
+      io.write("pwdebug: child attached\n")
+    elseif ev.event == "break" then
+      if ev.reason == "log" then
+        io.write(string.format(
+          "\n[LOG] %s:%d  [%s]\n",
+          (ev.frames[1] and ev.frames[1].source) or "?",
+          ev.line or 0,
+          ev.is_main and "main" or ("co:" .. tostring(ev.thread or ""):sub(-8))))
+        for i, f in ipairs(ev.frames) do
+          io.write(string.format("  #%d  %-24s %s:%d\n",
+            i, f.name or "?", f.source or "?", f.line or 0))
+        end
+      else
+        enter_repl(ev)
+      end
+    elseif ev.event == "error" then
+      io.stderr:write("stub error at " .. tostring(ev.where) ..
+        ": " .. tostring(ev.err) .. "\n")
+    end
+  end
+  os.execute("sleep 0.05")
+end
+
+sess:close()
