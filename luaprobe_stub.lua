@@ -5,13 +5,15 @@
 --   LUAPROBE_FIFO_OUT — stub writes events to (stack/locals on break)
 --   LUAPROBE_FIFO_IN  — stub reads commands from (step/next/continue/...)
 --
--- Breakpoints arrive via LUAPROBE_BREAKPOINTS as a newline-separated list
--- of FILE:LINE[!] [if EXPR]. The trailing ! means "log stack and
--- continue". The optional `if EXPR` makes the breakpoint conditional —
--- EXPR is a Lua expression evaluated at hit time with the function's
--- locals and upvalues in scope; the breakpoint fires only if truthy.
--- (Comma is also accepted as a legacy separator, but breakpoint
--- expressions can contain commas, so newline is now the canonical form.)
+-- Breakpoints arrive via LUAPROBE_BREAKPOINTS as a newline-separated
+-- list of FILE:LINE[!][[FIELDS]] [if EXPR]. The trailing ! means "log
+-- stack and continue". The optional [FIELDS] is a comma-list (inside
+-- brackets) controlling what gets captured per hit. The optional
+-- `if EXPR` makes the breakpoint conditional — EXPR is a Lua
+-- expression evaluated at hit time with the function's locals and
+-- upvalues in scope; the breakpoint fires only if truthy.
+-- Commas appear inside both [FIELDS] and conditions, so they are
+-- NOT a valid separator between specs — only `\n` is.
 --
 -- Coroutine caveat: debug.sethook is per-thread in Lua 5.1, so we
 -- monkey-patch coroutine.create / coroutine.wrap to install the hook on
@@ -172,9 +174,13 @@ local function del_bp_spec(spec)
   end
 end
 
--- Split env on newline first (canonical), then on comma (legacy).
-local sep = bps_env:find("\n", 1, true) and "\n" or ","
-for item in bps_env:gmatch("[^" .. sep .. "]+") do
+-- Newline is the only separator. We can't use comma any more —
+-- v2 specs embed commas inside [field,lists] and conditions
+-- (`if string.find(s, ",")`), so any comma-split would chop a
+-- single spec into malformed halves. An env value with no `\n` is
+-- treated as one spec (the common single-bp case from the
+-- controller).
+for item in bps_env:gmatch("[^\n]+") do
   if item:match("%S") then add_bp(item) end
 end
 

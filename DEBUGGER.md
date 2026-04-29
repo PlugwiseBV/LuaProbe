@@ -203,8 +203,10 @@ single line of Lua literals, the controller prints them, sends
 ### Breakpoint syntax cheat sheet
 
 Set via the `LUAPROBE_BREAKPOINTS` env var as a newline-separated
-list (comma is also accepted as a legacy separator, but newline is
-canonical because conditional expressions can contain commas):
+list. Newline is the **only** separator: conditional expressions
+and field lists both embed commas (`if string.find(s, ",")`,
+`[locals,stack]`), so a comma split would chop a single spec into
+malformed halves. An env value with no `\n` is treated as one spec.
 
 | spec | meaning |
 |---|---|
@@ -364,10 +366,9 @@ If either FIFO path is missing or empty, the stub returns immediately
 
 ### Breakpoint table
 
-Breakpoints arrive as a newline-separated list (commas are also
-accepted as a legacy separator — the parser picks `\n` when present,
-otherwise `,`, so old `,`-joined env vars from non-current
-controllers still work):
+Breakpoints arrive as a newline-separated list. Newline is the only
+separator (commas live inside `[fields]` and conditions, so they
+are NOT a valid spec separator):
 
 ```
 LUAPROBE_BREAKPOINTS="core/foo.lua:42
@@ -1076,7 +1077,7 @@ Set by the controller when spawning a debugged process:
 |-----|---------|
 | `LUAPROBE_FIFO_OUT` | abs path; child writes events to it (controller reads) |
 | `LUAPROBE_FIFO_IN`  | abs path; child reads commands from it (controller writes) |
-| `LUAPROBE_BREAKPOINTS` | newline-separated `FILE:LINE[!] [if EXPR]` list (comma also accepted as a legacy separator) |
+| `LUAPROBE_BREAKPOINTS` | newline-separated `FILE:LINE[!][[FIELDS]] [if EXPR]` list (newline is the only separator — commas appear inside both clauses) |
 | `LUA_INIT` | `@<abs path to luaprobe_stub.lua>` — how the stub gets loaded |
 
 The stub silently no-ops if `LUAPROBE_FIFO_OUT` is unset or empty, so
