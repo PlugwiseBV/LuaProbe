@@ -232,6 +232,113 @@ decodes it, prints what it wants, and sends a `continue` command.
 
 ---
 
+## Inspecting callers and coroutines
+
+When a breakpoint fires, the break event carries the *whole* Lua
+stack of the running thread, not just the function the breakpoint
+landed on. `vars[1]` is the top frame's locals/upvalues; `vars[2]`
+is its caller; and so on up to wherever the stack ends — the main
+chunk for the main thread, or the coroutine's body function for a
+coroutine.
+
+### Walking up the stack from the CLI
+
+After a break, the prompt shows the top frame. `bt` prints the
+full backtrace; `frame N` selects frame N as the "current" frame,
+and `locals`, `p NAME`, and `e EXPR` then all operate on *that*
+frame instead of the top one.
+
+```
+*** BREAK at proxy.lua:218  [main]  (reason=stop)
+* #1  fn@218                 proxy.lua:218
+  #2  send_request           net.lua:42
+  #3  scheduler_tick         scheduler.lua:117
+  #4  <main>                 main.lua:8
+
+(luaprobe) frame 3
+* #3  scheduler_tick         scheduler.lua:117
+(luaprobe) locals
+locals:
+  q = <table:32>
+  pending = 4
+  now = 1761748332
+(luaprobe) e #q + pending
+7
+(luaprobe) p q
+local q = { 1, 7, 12, ...}
+```
+
+### From the library API
+
+`session.frames` and `session.vars` mirror what the latest break
+event carried. They're parallel arrays — `frames[i]` and `vars[i]`
+both describe the same frame, frame 1 being the topmost.
+
+```lua
+-- Print every frame's locals from the most recent break.
+for i, frame in ipairs(sess.frames) do
+  print(string.format("#%d  %s  %s:%d",
+    i, frame.name, frame.source, frame.line))
+  for _, v in ipairs(sess.vars[i].locals or {}) do
+    print("  " .. v.name .. " = " .. v.value)
+  end
+end
+
+-- Deep-inspect or evaluate against any frame, not just the top one.
+-- Both calls take the frame table as the addressing key.
+sess:inspect_var(sess.frames[3], "local", "q")
+sess:cmd_eval("#q + pending", sess.frames[3])
+```
+
+For a "what was this on entry vs. now?" diff, each frame's
+`vars[i].entry` is the locals captured the moment the function was
+called, before its body ran — so for an ordinary Lua function you
+get exactly the parameter values it was invoked with, alongside
+their current (possibly mutated) values in `vars[i].locals`.
+`entry` is nil for C frames and main chunks.
+
+### Coroutines
+
+When a breakpoint fires inside a coroutine, the frames walk *that
+coroutine's* stack — not the main thread's. You'll see the
+function that hit the breakpoint at the top and the coroutine's
+body function at the bottom; the main-thread caller that did
+`coroutine.resume(co, ...)` to get here is **not** in the list,
+because Lua's `debug.getinfo` only walks the running thread and
+the running thread is the coroutine.
+
+The break event tells you which coroutine you're in and where it
+was spawned:
+
+```
+*** BREAK at handler.lua:42  [co:7f2ab0]  (reason=stop)
+    coroutine created at scheduler.lua:412
+```
+
+The same data is on the session object after `:poll()`:
+
+```lua
+sess.thread        -- "main" or "thread: 0x7f2a..."
+sess.is_main       -- true | false
+sess.created_src   -- file where coroutine.create was called, or nil
+sess.created_line  -- line number, or nil
+```
+
+Creation sites are captured by a monkey-patch on `coroutine.create`
+and `coroutine.wrap`. If you spawn coroutines through a helper
+(`scheduler:spawn(fn) -> coroutine.create(fn)`), the recorded site
+will be inside the helper, not at your `:spawn` call — only the
+immediate caller of `coroutine.create` is captured, not a full
+backtrace.
+
+A practical thing to know: you can only inspect *the* coroutine
+that hit the breakpoint. Other live or suspended coroutines are
+not enumerated — there is no "list all coroutines" command. To
+poke at a different coroutine, set a breakpoint inside the code
+it runs and let it execute.
+
+---
+
 ## API
 
 ### `luaprobe.new(opts) -> session | nil, err`
