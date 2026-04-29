@@ -1,4 +1,14 @@
-# LuaProbe
+<div align="center">
+  <h1 align="center">
+    Luaprobe
+    <br />
+    <br />
+    <a href="https://plugwise.com">
+      <img src="https://plugwise.com/img/luaprobe.svg" alt="Plugwise">
+    </a>
+  </h1>
+</div>
+
 
 A source-level debugger for Lua 5.1 / LuaJIT programs, implemented as
 two small files you drop into any project. No C extensions, no
