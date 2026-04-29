@@ -212,6 +212,10 @@ canonical because conditional expressions can contain commas):
 | `foo.lua:42!` | **Log** at line 42 of `foo.lua`. Emits a `break` event with `reason="log"` and continues immediately — no pause, no resume needed. |
 | `foo.lua:42 if x > 5` | **Conditional stop**. The expression after `if` is compiled lazily on first hit and evaluated against the function's locals + upvalues + `_G`; the breakpoint fires only if the result is truthy. Compile failures are logged once and treated as "never fire." Runtime errors during evaluation are silently treated as "skip this hit." |
 | `foo.lua:42! if x > 5` | **Conditional log**. Combines the above. |
+| `foo.lua:42![locals]` | **Capture filter** (include form). The break event will only carry the top frame's locals — no upvalues, no entry-snapshots, no further-up stack frames. The filter applies *at serialization time* in the stub: skipped fields aren't walked or `safe_serialize`d, so this is a real perf knob, not just a display one. |
+| `foo.lua:42![-upvalues]` | **Capture filter** (exclude form). Capture everything except upvalues. Mix of `+` and `-` is tolerated; the first item's prefix decides the starting state. |
+| `foo.lua:42![]` | Capture **nothing** beyond the line/source/reason and the top frame's identity. Cheapest possible log breakpoint. |
+| `foo.lua:42![locals,stack] if i > 5` | Filters and conditions compose freely with each other and with `!`. |
 | multi-line value | Multiple breakpoints in one env var, one per line. |
 
 Paths are matched by **suffix** against what `debug.getinfo` reports
@@ -388,6 +392,11 @@ bp_list[i] = {
   cond          = "user.id == target_id",  -- nil if unconditional
   cond_compiled = nil,  -- nil = not yet tried, false = compile failed,
                         --                         function = chunk
+  fields        = nil,  -- nil = capture everything (default).
+                        -- Otherwise: {stack=,locals=,upvalues=,entry=}
+                        -- four-key boolean table; collect_frames_from_hook_helper
+                        -- short-circuits the false ones so we don't pay
+                        -- the per-frame walk + safe_serialize cost.
 }
 ```
 

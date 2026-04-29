@@ -59,32 +59,94 @@ local function bp_path_matches(src, path)
   return src == path or src:sub(-(#path + 1)) == "/" .. path
 end
 
+-- Field set controls which optional parts of the break event get
+-- captured and serialized. Trimming any of these meaningfully reduces
+-- the per-hit cost when an unattended log breakpoint fires often:
+--   stack    — the full backtrace beyond the top frame
+--   locals   — per-frame local variables
+--   upvalues — per-frame function upvalues
+--   entry    — per-frame entry-time snapshots (parameter values at
+--              call time). Always nil for frames whose function isn't
+--              in a breakpointed file, so this only adds work when
+--              you've also asked the call hook to track it.
+-- A nil `fields` value means "default = everything on."
+local VALID_FIELDS = { stack = true, locals = true, upvalues = true, entry = true }
+
+local function parse_fields(str)
+  if str == nil then return nil end
+  -- Empty brackets `[]` mean "explicitly nothing extra": just the
+  -- top frame's identity (source/line/name), no values, no stack.
+  if str == "" or str:match("^%s*$") then
+    return { stack = false, locals = false, upvalues = false, entry = false }
+  end
+  -- Decide include vs. exclude mode by the first item's prefix.
+  -- All-`-`: subtract from default-all. Otherwise: pure include set,
+  -- starting from default-none. Mixed signs are tolerated but the
+  -- starting state is dictated by the first item only.
+  local items = {}
+  for item in str:gmatch("[^,]+") do
+    local t = item:match("^%s*(.-)%s*$")
+    if t ~= "" then items[#items + 1] = t end
+  end
+  if #items == 0 then
+    return { stack = false, locals = false, upvalues = false, entry = false }
+  end
+  local exclude_mode = items[1]:sub(1, 1) == "-"
+  local fields
+  if exclude_mode then
+    fields = { stack = true, locals = true, upvalues = true, entry = true }
+  else
+    fields = { stack = false, locals = false, upvalues = false, entry = false }
+  end
+  for _, it in ipairs(items) do
+    local sign, name = "+", it
+    if it:sub(1, 1) == "-" then sign = "-"; name = it:sub(2)
+    elseif it:sub(1, 1) == "+" then sign = "+"; name = it:sub(2) end
+    if VALID_FIELDS[name] then fields[name] = (sign == "+") end
+  end
+  return fields
+end
+
 -- Parse one spec string into its parts. Accepts:
 --   FILE:LINE
 --   FILE:LINE!
+--   FILE:LINE![FIELDS]            (only meaningful with `!`, but
+--   FILE:LINE![FIELDS] if EXPR     accepted on stop bps too)
 --   FILE:LINE if EXPR
 --   FILE:LINE! if EXPR
--- Returns (path, line, log_only, cond) or nil on malformed input.
--- Surrounding whitespace is trimmed; `cond` is nil if no `if` clause.
+-- Returns (path, line, log_only, cond, fields) or nil on malformed
+-- input. Surrounding whitespace is trimmed; `cond` and `fields` are
+-- nil when their respective clauses are absent.
 local function parse_spec(spec)
   spec = spec:match("^%s*(.-)%s*$")
   if spec == "" then return nil end
+  -- Pull off " if EXPR" first (rightmost), so brackets that are
+  -- inside the expression don't get mistaken for a field list.
   local head, cond = spec:match("^(.-)%s+if%s+(.+)$")
   if not head then head = spec end
+  -- Pull off "[FIELDS]" if present at the end.
+  local fields_str
+  local before_brackets, fields_match = head:match("^(.-)%[(.-)%]%s*$")
+  if before_brackets then
+    head = before_brackets:match("^%s*(.-)%s*$")
+    fields_str = fields_match
+  end
   local log_only = false
   if head:sub(-1) == "!" then
     log_only = true
     head = head:sub(1, -2)
   end
+  head = head:match("^%s*(.-)%s*$")
   local path, line = head:match("^(.-):(%d+)$")
   if not path or path == "" then return nil end
   line = tonumber(line)
   path = path:gsub("^%./", "")
-  return path, line, log_only, cond
+  local fields = parse_fields(fields_str)
+  return path, line, log_only, cond, fields
 end
 
 local function add_bp(spec)
-  local path, line, log_only, cond = parse_spec(spec)
+  local path, line, log_only, cond, fields = parse_spec(spec)
   if not path then return end
   bp_list[#bp_list + 1] = {
     path          = path,
@@ -94,6 +156,8 @@ local function add_bp(spec)
     cond          = cond,           -- raw expression source, or nil
     cond_compiled = nil,            -- nil = not yet tried, false = compile failed,
                                     -- function = compiled chunk
+    fields        = fields,         -- nil = capture everything, else
+                                    -- table {stack=,locals=,upvalues=,entry=}
   }
 end
 
@@ -403,7 +467,19 @@ local in_hook = false  -- reentrancy guard
 -- function. That's a stable anchor. From any helper one level deeper
 -- (i.e. this function), user code is at level 3. Nested helpers
 -- beyond that add Lua VM C dispatch frames which break the offset.
-local function collect_frames_from_hook_helper()
+--
+-- `fields` is the per-bp capture filter (or nil for "capture all").
+-- When set, it short-circuits the expensive parts: `stack=false`
+-- stops the walk after the top frame, and `locals=false` /
+-- `upvalues=false` / `entry=false` skip those iterations. The whole
+-- point of this hint is to avoid serializing data the user already
+-- said they don't want — an unattended log breakpoint that fires
+-- thousands of times pays the serialize cost on every hit.
+local function collect_frames_from_hook_helper(fields)
+  local want_stack    = not fields or fields.stack    ~= false
+  local want_locals   = not fields or fields.locals   ~= false
+  local want_upvalues = not fields or fields.upvalues ~= false
+  local want_entry    = not fields or fields.entry    ~= false
   local frames          = {}
   local locals_by_frame = {}
   local co              = coroutine.running()
@@ -452,18 +528,22 @@ local function collect_frames_from_hook_helper()
       line_def  = info.linedefined,
     }
 
-    local locals, upvals = {}, {}
-    local i = 1
-    while true do
-      local n, v = debug.getlocal(level, i)
-      if not n then break end
-      if n:sub(1, 1) ~= "(" then
-        locals[#locals + 1] = { name = n, value = safe_serialize(v) }
+    local locals, upvals
+    if want_locals then
+      locals = {}
+      local i = 1
+      while true do
+        local n, v = debug.getlocal(level, i)
+        if not n then break end
+        if n:sub(1, 1) ~= "(" then
+          locals[#locals + 1] = { name = n, value = safe_serialize(v) }
+        end
+        i = i + 1
       end
-      i = i + 1
     end
-    if info.func then
-      i = 1
+    if want_upvalues and info.func then
+      upvals = {}
+      local i = 1
       while true do
         local ok_n, n, v = pcall(debug.getupvalue, info.func, i)
         if not ok_n or not n then break end
@@ -473,7 +553,10 @@ local function collect_frames_from_hook_helper()
     end
     -- Look up this frame's entry-time snapshot, if any. find_entry_locals
     -- walks the per-thread entry stack for a matching func pointer.
-    local entry_locals = find_entry_locals(co, info.func)
+    local entry_locals
+    if want_entry then
+      entry_locals = find_entry_locals(co, info.func)
+    end
 
     locals_by_frame[#locals_by_frame + 1] = {
       locals   = locals,
@@ -482,6 +565,9 @@ local function collect_frames_from_hook_helper()
     }
 
     level = level + 1
+    -- `stack=false` stops after the top frame so we don't pay for the
+    -- walk plus per-frame locals/upvalues serialization on every hit.
+    if not want_stack then break end
     if level > 40 then break end
   end
   return frames, locals_by_frame
@@ -810,7 +896,10 @@ local function line_hook(event, line)
     end
     if should then
       step_mode = nil
-      local frames, vars = collect_frames_from_hook_helper()
+      -- Step events always capture everything — the user is paused
+      -- and may want to look at any field. Filters are a per-bp
+      -- thing, not a global one.
+      local frames, vars = collect_frames_from_hook_helper(nil)
       pause("step", line, frames, vars)
       return
     end
@@ -879,8 +968,9 @@ local function line_hook(event, line)
     -- here is user code, confirmed). Then call pause with the result
     -- as a NORMAL call (not a tail call — tail calls replace the
     -- current frame, which would shift the inspect command's levels
-    -- by 1 later on).
-    local frames, vars = collect_frames_from_hook_helper()
+    -- by 1 later on). `bp.fields` skips the expensive parts when the
+    -- user opted out via the spec's [fields] clause.
+    local frames, vars = collect_frames_from_hook_helper(bp.fields)
     pause(hit, line, frames, vars)
     return
   end

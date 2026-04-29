@@ -53,12 +53,40 @@ local function decode(line)
   return val
 end
 
+-- Field set emitted in the spec's optional `[FIELDS]` clause. Same
+-- semantics as the stub: `nil` means "default = capture everything".
+-- Otherwise a four-key boolean table picks which optional parts of
+-- the break event get serialized on each hit.
+local FIELD_NAMES = { "stack", "locals", "upvalues", "entry" }
+
+local function fields_clause(fields)
+  if not fields then return "" end
+  -- Pick the more compact form: if 3+ fields are on, emit the
+  -- minus-form (everything except those that are off); otherwise
+  -- emit the include form.
+  local on_count, off_names, on_names = 0, {}, {}
+  for _, k in ipairs(FIELD_NAMES) do
+    if fields[k] then on_count = on_count + 1; on_names[#on_names + 1] = k
+    else off_names[#off_names + 1] = "-" .. k end
+  end
+  if on_count == #FIELD_NAMES then
+    return ""  -- equivalent to default; don't bother emitting brackets
+  elseif on_count == 0 then
+    return "[]"
+  elseif on_count >= 3 then
+    return "[" .. table.concat(off_names, ",") .. "]"
+  else
+    return "[" .. table.concat(on_names, ",") .. "]"
+  end
+end
+
 -- Re-emit a parsed bp as the canonical wire string the stub expects.
 -- Module-scope (not a method) so it can be called from env_prefix and
 -- add_breakpoint without depending on Session lookup order.
 local function bp_to_spec(bp)
   return bp.path .. ":" .. bp.line ..
-         (bp.log  and "!"          or "") ..
+         (bp.log  and "!" or "") ..
+         fields_clause(bp.fields) ..
          (bp.cond and (" if " .. bp.cond) or "")
 end
 
@@ -321,28 +349,76 @@ end
 
 -- ---------- breakpoint management ----------
 
--- Parse a breakpoint spec: "FILE:LINE", "FILE:LINE!", "FILE:LINE if EXPR",
--- or "FILE:LINE! if EXPR". Returns a `bp` table or nil for malformed
--- input. The `cond` field is a raw expression source string (or nil)
--- and is shipped verbatim to the stub, which compiles it lazily on
--- first hit.
+-- Parse a breakpoint spec. Accepts:
+--   FILE:LINE
+--   FILE:LINE!
+--   FILE:LINE![FIELDS]
+--   FILE:LINE if EXPR
+--   FILE:LINE![FIELDS] if EXPR        (any combination of !, [...], if)
+-- Returns a `bp` table or nil for malformed input. The `cond` field
+-- is a raw expression source string (or nil) and is shipped
+-- verbatim to the stub, which compiles it lazily on first hit. The
+-- `fields` field is nil (capture everything) or a four-key boolean
+-- table {stack=, locals=, upvalues=, entry=}.
+local FIELD_NAMES_PARSE = { stack = true, locals = true, upvalues = true, entry = true }
+
+local function parse_fields_clause(str)
+  if str == nil then return nil end
+  if str == "" or str:match("^%s*$") then
+    return { stack = false, locals = false, upvalues = false, entry = false }
+  end
+  local items = {}
+  for item in str:gmatch("[^,]+") do
+    local t = item:match("^%s*(.-)%s*$")
+    if t ~= "" then items[#items + 1] = t end
+  end
+  if #items == 0 then
+    return { stack = false, locals = false, upvalues = false, entry = false }
+  end
+  local exclude_mode = items[1]:sub(1, 1) == "-"
+  local fields
+  if exclude_mode then
+    fields = { stack = true, locals = true, upvalues = true, entry = true }
+  else
+    fields = { stack = false, locals = false, upvalues = false, entry = false }
+  end
+  for _, it in ipairs(items) do
+    local sign, name = "+", it
+    if it:sub(1, 1) == "-" then sign = "-"; name = it:sub(2)
+    elseif it:sub(1, 1) == "+" then sign = "+"; name = it:sub(2) end
+    if FIELD_NAMES_PARSE[name] then fields[name] = (sign == "+") end
+  end
+  return fields
+end
+
 function Session:_parse_bp(spec)
   spec = spec:match("^%s*(.-)%s*$")
   if spec == "" then return nil end
+  -- Pull off " if EXPR" first so any brackets in the expression
+  -- aren't mistaken for a [fields] clause.
   local head, cond = spec:match("^(.-)%s+if%s+(.+)$")
   if not head then head = spec end
+  -- Then pull off "[FIELDS]" if it sits at the end.
+  local fields_str
+  local before_brackets, fields_match = head:match("^(.-)%[(.-)%]%s*$")
+  if before_brackets then
+    head = before_brackets:match("^%s*(.-)%s*$")
+    fields_str = fields_match
+  end
   local log_only = false
   if head:sub(-1) == "!" then
     log_only = true
     head = head:sub(1, -2)
   end
+  head = head:match("^%s*(.-)%s*$")
   local path, line = head:match("^(.-):(%d+)$")
   if not path or path == "" then return nil end
   return {
-    path = path:gsub("^%./", ""),
-    line = tonumber(line),
-    log  = log_only,
-    cond = cond,
+    path   = path:gsub("^%./", ""),
+    line   = tonumber(line),
+    log    = log_only,
+    cond   = cond,
+    fields = parse_fields_clause(fields_str),
   }
 end
 
@@ -352,16 +428,17 @@ end
 -- is pushed live via add_bp. Otherwise it's added to the list and
 -- will be included in the env prefix the next time env_prefix() is
 -- called.
-function Session:add_breakpoint(spec_or_path, line, log_only, cond)
+function Session:add_breakpoint(spec_or_path, line, log_only, cond, fields)
   local bp
   if type(spec_or_path) == "string" and line == nil then
     bp = self:_parse_bp(spec_or_path)
   else
     bp = {
-      path = tostring(spec_or_path):gsub("^%./", ""),
-      line = tonumber(line),
-      log  = log_only or false,
-      cond = cond,
+      path   = tostring(spec_or_path):gsub("^%./", ""),
+      line   = tonumber(line),
+      log    = log_only or false,
+      cond   = cond,
+      fields = fields,
     }
   end
   if not bp then return false end

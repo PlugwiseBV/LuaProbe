@@ -31,6 +31,12 @@ What you get:
 - **Conditional breakpoints**: `foo.lua:42 if x > 5 and y ~= nil`.
   The condition is a Lua expression evaluated at hit time with the
   function's locals and upvalues in scope — fires only when truthy.
+- **Capture filters**: `foo.lua:42![locals]` or `foo.lua:42![-upvalues]`
+  controls which optional parts of the break event get serialized
+  (stack / locals / upvalues / entry-snapshots). The default is
+  everything; trimming matters for unattended log breakpoints that
+  fire often, where serializing huge upvalue tables on every hit
+  is the dominant cost.
 - Full Lua stack walking at every break, with locals, upvalues, and
   **entry-time snapshots** (the parameter values the function was
   called with, before its body modified them).
@@ -359,11 +365,30 @@ local sess = luaprobe.new({
 The session will inject this into the child's `LUA_INIT`.
 
 **`breakpoints`** (optional) — initial breakpoint specs as an array
-of strings, each `"FILE:LINE"` (stop), `"FILE:LINE!"` (log-only:
-send the stack and continue without pausing), or either of the
-above followed by `" if EXPR"` to make it conditional. Examples:
-`"foo.lua:42"`, `"foo.lua:42!"`, `"foo.lua:42 if x > 5"`,
-`"foo.lua:42! if user.id == target_id"`.
+of strings. Full grammar:
+
+```
+FILE:LINE  [!]  [[FIELDS]]  [ if EXPR ]
+```
+
+- `!` makes the breakpoint log-only (emit a `break` event with
+  `reason="log"` and continue immediately, no pause).
+- `[FIELDS]` is an optional bracketed comma-list controlling which
+  optional parts of the break event get captured. Names: `stack`,
+  `locals`, `upvalues`, `entry`. Two forms:
+  - **Include** — `[locals,stack]` means *only* these.
+  - **Exclude** — `[-upvalues,-entry]` means everything *except*
+    these.
+  - `[]` means "nothing extra" — just the line, source, and reason.
+  - Omitted entirely (the common case): capture everything.
+- `if EXPR` makes it conditional — Lua expression evaluated against
+  the function's locals/upvalues with `_G` as fallback; fires only
+  when truthy.
+
+Examples: `"foo.lua:42"`, `"foo.lua:42!"`, `"foo.lua:42 if x > 5"`,
+`"foo.lua:42! if user.id == target_id"`,
+`"foo.lua:42![-upvalues]"`,
+`"foo.lua:42![locals,stack] if i > 1000"`.
 
 **`source_roots`** (optional) — directories to search when resolving
 relative source paths in `session:get_source(path)`. Default:
@@ -472,15 +497,18 @@ for _, ev in ipairs(sess:poll()) do
 end
 ```
 
-### `session:add_breakpoint(spec) / :add_breakpoint(path, line, log_only, cond)`
+### `session:add_breakpoint(spec) / :add_breakpoint(path, line, log_only, cond, fields)`
 
-Add a breakpoint during a running session. Takes either a
-`"FILE:LINE[!] [if EXPR]"` string or four explicit arguments
-(`cond` is a raw Lua expression source string, or nil).
+Add a breakpoint during a running session. Takes either a spec
+string (full grammar: `FILE:LINE[!][[FIELDS]] [if EXPR]`) or five
+explicit arguments. `cond` is a raw Lua expression source string
+(or nil); `fields` is nil (capture everything — the default) or
+a four-key boolean table `{stack=, locals=, upvalues=, entry=}`.
 Deduplicates against the existing breakpoint list by (path, line)
 — there can be only one breakpoint per source location, so adding
 a second one with the same key returns `false` even if the
-condition or log-mode differs (remove the old one first).
+condition / log-mode / field-set differs (remove the old one
+first).
 
 If the stub is already attached, pushes the breakpoint live via
 an `add_bp` command; the stub's snap logic will kick in on the
@@ -569,8 +597,8 @@ is where the `function(...)` keyword sits, so `fn@218` means
 
 ```lua
 {
-  locals   = { {name="x", value="42"}, ... },
-  upvalues = { {name="self", value="<table:12>"}, ... },
+  locals   = { {name="x", value="42"}, ... } | nil,
+  upvalues = { {name="self", value="<table:12>"}, ... } | nil,
   entry    = { {name="x", value="7"}, ... } | nil,
 }
 ```
@@ -580,6 +608,12 @@ of this frame's function — which happens automatically for
 functions in files with active breakpoints, via the call hook. Diff
 `locals` against `entry` to show "was:" values alongside the
 current ones.
+
+`locals` and `upvalues` may also be nil when the breakpoint that
+fired had a capture filter that excluded them (`[-locals]` /
+`[-upvalues]` / `[]`). Similarly, when `[FIELDS]` excluded
+`stack`, only the top frame is present in `frames` / `vars` even
+though the call chain was deeper.
 
 ### `{ event = "inspect", name = ..., kind = ..., repr = "..." }`
 
@@ -615,7 +649,7 @@ protocol.
 | step | `{cmd="step"}` |
 | next | `{cmd="next"}` |
 | finish | `{cmd="finish"}` |
-| add breakpoint | `{cmd="add_bp", spec="foo.lua:42[!] [if EXPR]"}` |
+| add breakpoint | `{cmd="add_bp", spec="foo.lua:42[!][[FIELDS]] [if EXPR]"}` |
 | remove breakpoint | `{cmd="del_bp", spec="foo.lua:42"}` |
 | inspect variable | `{cmd="inspect", src="foo.lua", src_line=42, kind="local", name="x"}` |
 | eval expression | `{cmd="eval", expr="x + 1", src="foo.lua", src_line=42}` (`src`/`src_line` optional — defaults to the topmost user frame) |

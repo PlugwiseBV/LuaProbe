@@ -31,10 +31,17 @@
 --   e EXPR     evaluate a Lua expression in the current frame; locals
 --              and upvalues are in scope, with _G as the fallback
 --   frame N    select frame index N (1 = top)
---   b FILE:L[!] [if EXPR]
---              add a breakpoint at runtime; ! makes it log-only,
+--   b FILE:L[!][[FIELDS]] [if EXPR]
+--              add a breakpoint at runtime. ! makes it log-only.
 --              `if EXPR` makes it conditional (fires only when EXPR
---              evaluates truthy in the breakpointed frame)
+--              evaluates truthy in the breakpointed frame). [FIELDS]
+--              is an optional capture filter: a comma-list of
+--              `stack`, `locals`, `upvalues`, `entry` (the include
+--              form), or any of those prefixed with `-` (the exclude
+--              form). Default is everything; [] means "nothing
+--              extra, just the line and reason." Useful for log
+--              breakpoints that fire often, where serializing huge
+--              upvalues every hit is expensive.
 --   d FILE:L   delete a breakpoint at runtime
 --   bps        list breakpoints
 --   q          quit (kills the target)
@@ -278,14 +285,28 @@ local function print_source(ev, n)
   end
 end
 
+local FIELD_ORDER = { "stack", "locals", "upvalues", "entry" }
+
+local function format_fields(fields)
+  if not fields then return "" end
+  local on = {}
+  for _, k in ipairs(FIELD_ORDER) do
+    if fields[k] then on[#on + 1] = k end
+  end
+  if #on == #FIELD_ORDER then return "" end  -- all on = default
+  if #on == 0 then return "  fields=[]" end
+  return "  fields=[" .. table.concat(on, ",") .. "]"
+end
+
 local function print_bps()
   if #sess.breakpoints == 0 then
     io.write("  (no breakpoints)\n")
     return
   end
   for _, bp in ipairs(sess.breakpoints) do
-    io.write(string.format("  %s%s:%d%s\n",
+    io.write(string.format("  %s%s:%d%s%s\n",
       bp.log and "[log] " or "[stop] ", bp.path, bp.line,
+      format_fields(bp.fields),
       bp.cond and ("  if " .. bp.cond) or ""))
   end
 end
@@ -328,9 +349,14 @@ commands:
                (locals/upvalues in scope, _G fallback; reads see a
                snapshot — local writes don't persist back)
   frame N      select stack frame N (1 = topmost)
-  b FILE:L[!] [if EXPR]
-               add a breakpoint; ! makes it log-only, `if EXPR` makes
-               it conditional (fires only when EXPR is truthy)
+  b FILE:L[!] [FIELDS] [if EXPR]
+               add a breakpoint. ! makes it log-only; `if EXPR` makes
+               it conditional; [FIELDS] is a bracketed comma-list of
+               stack,locals,upvalues,entry (or with `-` prefix to
+               exclude) controlling what gets captured on each hit.
+               Example: foo.lua:42![-upvalues] if i > 5
+               Default = capture everything. Useful for log bps that
+               fire often.
   d FILE:L     delete a breakpoint
   bps          list active breakpoints
   q, quit      quit the debugger (kills the target)
@@ -481,14 +507,42 @@ while running do
       io.write("luaprobe: child attached\n")
     elseif ev.event == "break" then
       if ev.reason == "log" then
+        local top_src = (ev.frames and ev.frames[1] and ev.frames[1].source) or "?"
         io.write(string.format(
           "\n[LOG] %s:%d  [%s]\n",
-          (ev.frames[1] and ev.frames[1].source) or "?",
-          ev.line or 0,
+          top_src, ev.line or 0,
           ev.is_main and "main" or ("co:" .. tostring(ev.thread or ""):sub(-8))))
-        for i, f in ipairs(ev.frames) do
+        if ev.created_src then
+          io.write(string.format("    coroutine created at %s:%d\n",
+            ev.created_src, ev.created_line or 0))
+        end
+        for i, f in ipairs(ev.frames or {}) do
           io.write(string.format("  #%d  %-24s %s:%d\n",
             i, f.name or "?", f.source or "?", f.line or 0))
+        end
+        -- Top frame's locals/upvalues/entry, if the bp didn't opt out
+        -- of capturing them via [fields]. Each section is omitted
+        -- when its array is missing (filter said no) or empty.
+        local fv = ev.vars and ev.vars[1]
+        if fv then
+          if fv.locals and #fv.locals > 0 then
+            io.write("  locals:\n")
+            for _, v in ipairs(fv.locals) do
+              io.write(string.format("    %s = %s\n", v.name, v.value))
+            end
+          end
+          if fv.upvalues and #fv.upvalues > 0 then
+            io.write("  upvalues:\n")
+            for _, v in ipairs(fv.upvalues) do
+              io.write(string.format("    %s = %s\n", v.name, v.value))
+            end
+          end
+          if fv.entry and #fv.entry > 0 then
+            io.write("  entry (values at function entry):\n")
+            for _, v in ipairs(fv.entry) do
+              io.write(string.format("    %s = %s\n", v.name, v.value))
+            end
+          end
         end
       else
         enter_repl(ev)
