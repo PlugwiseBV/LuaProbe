@@ -28,12 +28,19 @@ What you get:
 
 - File+line breakpoints (stop or log-only) with **snap-forward**
   semantics, so you don't have to pick an executable line exactly.
+- **Conditional breakpoints**: `foo.lua:42 if x > 5 and y ~= nil`.
+  The condition is a Lua expression evaluated at hit time with the
+  function's locals and upvalues in scope — fires only when truthy.
 - Full Lua stack walking at every break, with locals, upvalues, and
   **entry-time snapshots** (the parameter values the function was
   called with, before its body modified them).
 - On-demand **deep inspection** of any variable: press one key, get
   a full recursive table dump with cycle safety and configurable
   depth/key caps.
+- **Eval-during-pause**: type any Lua expression at the prompt and
+  it runs in the paused frame's scope (locals/upvalues/globals all
+  visible). Side effects on globals and table mutations persist;
+  writes to locals don't.
 - **Coroutine-aware** — breakpoints fire inside coroutines, the
   break event identifies which coroutine, and the stub records
   where each coroutine was spawned so you can trace back to the
@@ -126,7 +133,8 @@ local message = "hello, world"
 
 Commands: `c`/`s`/`n`/`f` (continue/step/next/finish), `bt` (stack),
 `l [N]` (source around the current line), `locals`, `p NAME` (deep
-inspect a variable), `frame N` (select frame), `b FILE:L[!]` /
+inspect a variable), `e EXPR` (evaluate a Lua expression in the
+current frame), `frame N` (select frame), `b FILE:L[!] [if EXPR]` /
 `d FILE:L` (add/remove breakpoint), `bps` (list breakpoints), `q`.
 Type `help` for the full list. Run `luaprobe --help` for CLI options.
 
@@ -244,8 +252,11 @@ local sess = luaprobe.new({
 The session will inject this into the child's `LUA_INIT`.
 
 **`breakpoints`** (optional) — initial breakpoint specs as an array
-of strings, each `"FILE:LINE"` (stop) or `"FILE:LINE!"` (log-only:
-send the stack and continue without pausing).
+of strings, each `"FILE:LINE"` (stop), `"FILE:LINE!"` (log-only:
+send the stack and continue without pausing), or either of the
+above followed by `" if EXPR"` to make it conditional. Examples:
+`"foo.lua:42"`, `"foo.lua:42!"`, `"foo.lua:42 if x > 5"`,
+`"foo.lua:42! if user.id == target_id"`.
 
 **`source_roots`** (optional) — directories to search when resolving
 relative source paths in `session:get_source(path)`. Default:
@@ -296,6 +307,37 @@ depth ≤ current). `finish` runs until the current function returns
 (same thread, stack depth < current). All three resume immediately;
 the next break event arrives when the step condition is met.
 
+### `session:cmd_eval(expr, frame)`
+
+Evaluate a Lua expression in a paused frame's scope. `frame` is
+optional — if omitted, the stub picks the topmost user frame. The
+expression sees the frame's locals and upvalues directly, with `_G`
+as the fallback for any unbound name.
+
+Reads on locals and upvalues see snapshot values; assignments to
+them do **not** propagate back to the live frame (writes silently
+go nowhere). Globals and table mutations work normally — a call
+to `table.insert(some_table, x)` will be visible after `continue`.
+
+The result arrives asynchronously as an event from the next
+`:poll()`:
+
+```lua
+sess:cmd_eval("self.cache.size", sess.frames[1])
+-- ...
+for _, ev in ipairs(sess:poll()) do
+  if ev.event == "eval" then
+    if ev.err then print("error: " .. ev.err)
+    else            print(ev.expr .. " = " .. ev.repr) end
+  end
+end
+```
+
+Internally, the stub first tries to compile the input as
+`return (EXPR)`; if that fails (e.g. you passed a statement like
+`print('hi')`), it falls back to compiling the raw text as a
+chunk. Statement form runs but the reply carries no `repr`.
+
 ### `session:inspect_var(frame, kind, name)`
 
 Ask the stub for a deep dump of a variable in a specific frame.
@@ -323,13 +365,20 @@ for _, ev in ipairs(sess:poll()) do
 end
 ```
 
-### `session:add_breakpoint(spec) / :add_breakpoint(path, line, log_only)`
+### `session:add_breakpoint(spec) / :add_breakpoint(path, line, log_only, cond)`
 
 Add a breakpoint during a running session. Takes either a
-`"FILE:LINE[!]"` string or three explicit arguments. Deduplicates
-against the existing breakpoint list. If the stub is already
-attached, pushes the breakpoint live via an `add_bp` command; the
-stub's snap logic will kick in on the next matching hit.
+`"FILE:LINE[!] [if EXPR]"` string or four explicit arguments
+(`cond` is a raw Lua expression source string, or nil).
+Deduplicates against the existing breakpoint list by (path, line)
+— there can be only one breakpoint per source location, so adding
+a second one with the same key returns `false` even if the
+condition or log-mode differs (remove the old one first).
+
+If the stub is already attached, pushes the breakpoint live via
+an `add_bp` command; the stub's snap logic will kick in on the
+next matching hit and the condition (if any) is compiled lazily
+on first match.
 
 Returns `true` if added, `false` if it was already present or the
 spec was malformed.
@@ -431,6 +480,13 @@ Emitted in response to a `session:inspect_var(...)` call. `repr`
 is the deep serialization of the variable, ready to be
 pretty-printed.
 
+### `{ event = "eval", expr = ..., repr = ... | nil, err = ... | nil }`
+
+Emitted in response to a `session:cmd_eval(...)` call. Exactly one
+of `repr` / `err` is set: `repr` is the deep serialization of the
+expression's result, `err` is a human-readable string for compile
+failures (`"compile: ..."`) or runtime errors (`"runtime: ..."`).
+
 ### `{ event = "error", where = ..., err = ... }`
 
 Emitted if the stub catches an internal error during break handling
@@ -452,9 +508,10 @@ protocol.
 | step | `{cmd="step"}` |
 | next | `{cmd="next"}` |
 | finish | `{cmd="finish"}` |
-| add breakpoint | `{cmd="add_bp", spec="foo.lua:42"}` or `"foo.lua:42!"` |
+| add breakpoint | `{cmd="add_bp", spec="foo.lua:42[!] [if EXPR]"}` |
 | remove breakpoint | `{cmd="del_bp", spec="foo.lua:42"}` |
 | inspect variable | `{cmd="inspect", src="foo.lua", src_line=42, kind="local", name="x"}` |
+| eval expression | `{cmd="eval", expr="x + 1", src="foo.lua", src_line=42}` (`src`/`src_line` optional — defaults to the topmost user frame) |
 
 All commands are fire-and-forget; replies (when they exist) arrive
 asynchronously as events from `:poll()`.
@@ -486,8 +543,11 @@ patterns to bug classes.
 
 - Breakpoints only snap forward (nearest executable line at or
   after the requested line, within the same function scope).
-- No conditional breakpoints, no watchpoints, no `eval` during
-  pause.
+- No watchpoints (no `debug` facility for "break when variable X
+  changes"; you'd need to poll).
+- `eval` runs against a snapshot of the paused frame's locals and
+  upvalues, so writing back to a local doesn't persist. Globals
+  and table mutations still work normally.
 - Coroutines created by C code via `lua_newthread` (bypassing
   Lua-level `coroutine.create`) are invisible to the debugger.
 - FIFO transport is local-only. No network debugging.

@@ -202,13 +202,17 @@ single line of Lua literals, the controller prints them, sends
 
 ### Breakpoint syntax cheat sheet
 
-Set via the `LUAPROBE_BREAKPOINTS` env var as a comma-separated list:
+Set via the `LUAPROBE_BREAKPOINTS` env var as a newline-separated
+list (comma is also accepted as a legacy separator, but newline is
+canonical because conditional expressions can contain commas):
 
 | spec | meaning |
 |---|---|
 | `foo.lua:42` | **Stop** at line 42 of `foo.lua`. Pauses the process until the controller sends a resume command. |
 | `foo.lua:42!` | **Log** at line 42 of `foo.lua`. Emits a `break` event with `reason="log"` and continues immediately — no pause, no resume needed. |
-| `foo/bar.lua:42,baz.lua:10,baz.lua:20!` | Multiple breakpoints in one go. |
+| `foo.lua:42 if x > 5` | **Conditional stop**. The expression after `if` is compiled lazily on first hit and evaluated against the function's locals + upvalues + `_G`; the breakpoint fires only if the result is truthy. Compile failures are logged once and treated as "never fire." Runtime errors during evaluation are silently treated as "skip this hit." |
+| `foo.lua:42! if x > 5` | **Conditional log**. Combines the above. |
+| multi-line value | Multiple breakpoints in one env var, one per line. |
 
 Paths are matched by **suffix** against what `debug.getinfo` reports
 (which is whatever the loader used). You can abbreviate generously:
@@ -356,14 +360,22 @@ If either FIFO path is missing or empty, the stub returns immediately
 
 ### Breakpoint table
 
-Breakpoints arrive as a comma-separated list:
+Breakpoints arrive as a newline-separated list (commas are also
+accepted as a legacy separator — the parser picks `\n` when present,
+otherwise `,`, so old `,`-joined env vars from non-current
+controllers still work):
 
 ```
-LUAPROBE_BREAKPOINTS="core/foo.lua:42,core/bar.lua:88!"
+LUAPROBE_BREAKPOINTS="core/foo.lua:42
+core/bar.lua:88!
+core/baz.lua:10 if user.id == target_id"
 ```
 
 `FILE:LINE` is a **stop** breakpoint; the trailing `!` makes it a
-**log** breakpoint (send the stack but don't pause).
+**log** breakpoint (send the stack but don't pause). An optional
+`if EXPR` clause makes the breakpoint conditional — the expression
+is shipped verbatim, compiled lazily on first hit, and evaluated
+against the function's locals/upvalues with `_G` as the fallback.
 
 Internally they're stored as an array:
 
@@ -373,6 +385,9 @@ bp_list[i] = {
   requested     = 42,
   mode          = "stop" | "log",
   resolved_line = nil,  -- filled in by snap, see below
+  cond          = "user.id == target_id",  -- nil if unconditional
+  cond_compiled = nil,  -- nil = not yet tried, false = compile failed,
+                        --                         function = chunk
 }
 ```
 
@@ -630,6 +645,14 @@ get the resulting table, and dispatches on `msg.cmd`:
   loop; keeps reading more commands.
 - `inspect` — computes a deep dump of a specific variable and
   replies with an `inspect` event. Does **not** exit the loop.
+- `eval` — compiles the supplied expression against a snapshot env
+  built from the addressed frame's locals/upvalues with `_G` as
+  fallback, runs it under `pcall`, and replies with an `eval`
+  event carrying either `repr` (success) or `err` (compile or
+  runtime failure). Does **not** exit the loop. The compile path
+  tries `return (EXPR)` first, then falls back to compiling the
+  raw text as a chunk so statements like `print(x)` also work
+  (with no return value).
 
 Log breakpoints (`reason == "log"`) skip the loop entirely: they
 send the event and return immediately.
@@ -714,7 +737,7 @@ through `loadstring` correctly.
 -- Emitted once after the stub finishes initializing.
 return {
   event = "hello",
-  bps   = "core/foo.lua:42,core/bar.lua:88!",
+  bps   = "core/foo.lua:42\ncore/bar.lua:88!\ncore/baz.lua:10 if x > 5",
 }
 
 -- Emitted on every stop or log breakpoint.
@@ -736,6 +759,17 @@ return {
   name  = "someVar",
   kind  = "local" | "upvalue",
   repr  = "{...}",  -- deep serialization
+}
+
+-- Emitted in reply to an eval command. Exactly one of repr/err is
+-- non-nil. `err` is human-readable: "compile: ..." for parse
+-- failures, "runtime: ..." for errors thrown by pcall.
+return {
+  event = "eval",
+  expr  = "self.foo + 1",
+  repr  = "42",  -- nil if `err` is set, or if the input was a
+                 -- statement (no return value)
+  err   = nil,   -- or "compile: ..." / "runtime: ..."
 }
 ```
 
@@ -776,7 +810,10 @@ return { cmd = "continue" }
 return { cmd = "step" }
 return { cmd = "next" }
 return { cmd = "finish" }
-return { cmd = "add_bp", spec = "core/foo.lua:42" }     -- or "core/foo.lua:42!"
+-- spec accepts the same grammar as LUAPROBE_BREAKPOINTS: a single
+-- "FILE:LINE" optionally followed by "!" (log-only) and/or
+-- " if EXPR" (conditional).
+return { cmd = "add_bp", spec = "core/foo.lua:42 if x > 5" }
 return { cmd = "del_bp", spec = "core/foo.lua:42" }
 return {
   cmd      = "inspect",
@@ -784,6 +821,14 @@ return {
   src_line = 42,
   kind     = "local",
   name     = "someVar",
+}
+-- src/src_line are optional; if omitted, eval runs in the topmost
+-- user (Lua/main) frame on the live stack.
+return {
+  cmd      = "eval",
+  expr     = "self.foo + 1",
+  src      = "core/foo.lua",
+  src_line = 42,
 }
 ```
 
@@ -950,39 +995,43 @@ Typical diagnostic workflow:
 3. **Only one breakpoint per source:line.** `add_bp` doesn't
    deduplicate on the stub side; adding the same `file:line` twice
    creates two entries and both will fire. The controller
-   deduplicates before sending.
-4. **No conditional breakpoints.** Every hit pauses (or logs).
-5. **No watchpoints.** There is no `debug` facility for "break when
+   deduplicates before sending. Practical consequence: to change a
+   condition or toggle log-mode, remove the old bp first.
+4. **No watchpoints.** There is no `debug` facility for "break when
    variable X changes"; you'd need to poll.
-6. **No `eval` inside the pause loop.** The stub has all the
-   machinery to run a user expression in the paused frame's
-   environment, but the command isn't wired up. Would take ~30
-   lines: `loadstring(expr)` with an env table that proxies
-   `__index`/`__newindex` through `getlocal`/`setlocal` and
-   `getupvalue`/`setupvalue`.
-7. **No reverse/ history debugging.** Pure forward execution.
-8. **Coroutines created by C code are invisible.** See "Coroutine
+5. **`eval` is read-only on locals/upvalues.** The stub builds a
+   snapshot env from the paused frame's locals and upvalues and
+   evaluates the expression against it; assignments to those names
+   don't propagate back to the live frame. Globals and table
+   mutations work normally because they go through references that
+   survive the snapshot. Promoting eval to read-write would need an
+   `__newindex` that calls `debug.setlocal`/`setupvalue` with the
+   right level discipline (see §"Level discipline" — the same
+   minefield that makes inspect re-walk the live stack instead of
+   reusing captured levels).
+6. **No reverse/ history debugging.** Pure forward execution.
+7. **Coroutines created by C code are invisible.** See "Coroutine
    tracking" above.
-9. **Entry snapshots are approximate under tail calls.** Tail-call
+8. **Entry snapshots are approximate under tail calls.** Tail-call
    and tail-return events are treated as ordinary call/return for
    the entry-stack balance; a long tail-recursive chain will
    accumulate entries that never pop until the outermost frame
    returns. In practice this only bloats memory for pathological
    recursion, not correctness.
-10. **Cycle detection is scope-local per serialization, not global.**
-    A table reachable via two separate paths in the same frame's
-    vars will be serialized fully twice (within depth/key caps).
-    Not a correctness bug, just occasional output bloat.
-11. **Compiled bytecode chunks (`info.source` starting with `=`)**
+9. **Cycle detection is scope-local per serialization, not global.**
+   A table reachable via two separate paths in the same frame's
+   vars will be serialized fully twice (within depth/key caps).
+   Not a correctness bug, just occasional output bloat.
+10. **Compiled bytecode chunks (`info.source` starting with `=`)**
     are matched by basename suffix only. Chunks loaded from a
     string via `loadstring(code, "chunkname")` work if `chunkname`
     ends with a known file name.
-12. **No strict-mode check for global reads.** A future improvement
+11. **No strict-mode check for global reads.** A future improvement
     would be loading a `strict.lua` helper into the stub at startup
     so that accidentally referencing an undeclared local (which Lua
     resolves to a nil global) errors at access time instead of
     failing mysteriously at runtime.
-13. **FIFO transport is local-only.** `/tmp/luaprobe-*.{in,out}`
+12. **FIFO transport is local-only.** `/tmp/luaprobe-*.{in,out}`
     only works when both processes are on the same host. No network
     transparency.
 
@@ -1018,7 +1067,7 @@ Set by the controller when spawning a debugged process:
 |-----|---------|
 | `LUAPROBE_FIFO_OUT` | abs path; child writes events to it (controller reads) |
 | `LUAPROBE_FIFO_IN`  | abs path; child reads commands from it (controller writes) |
-| `LUAPROBE_BREAKPOINTS` | comma-separated `FILE:LINE[!]` list |
+| `LUAPROBE_BREAKPOINTS` | newline-separated `FILE:LINE[!] [if EXPR]` list (comma also accepted as a legacy separator) |
 | `LUA_INIT` | `@<abs path to luaprobe_stub.lua>` — how the stub gets loaded |
 
 The stub silently no-ops if `LUAPROBE_FIFO_OUT` is unset or empty, so

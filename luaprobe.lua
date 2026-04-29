@@ -53,6 +53,15 @@ local function decode(line)
   return val
 end
 
+-- Re-emit a parsed bp as the canonical wire string the stub expects.
+-- Module-scope (not a method) so it can be called from env_prefix and
+-- add_breakpoint without depending on Session lookup order.
+local function bp_to_spec(bp)
+  return bp.path .. ":" .. bp.line ..
+         (bp.log  and "!"          or "") ..
+         (bp.cond and (" if " .. bp.cond) or "")
+end
+
 -- Encode a flat table of primitives as a `return {...}` Lua chunk,
 -- one line. Type-aware so numbers land on the stub as numbers, not
 -- as quoted strings.
@@ -68,8 +77,15 @@ local function encode_cmd(tbl)
     end
     parts[#parts + 1] = k .. "=" .. enc .. ","
   end
-  parts[#parts + 1] = "}\n"
-  return table.concat(parts)
+  parts[#parts + 1] = "}"
+  local s = table.concat(parts)
+  -- %q embeds raw newlines for `\n` inside source strings, which
+  -- would break the one-message-per-line wire framing. Normalize to
+  -- proper `\n` escapes (same trick the stub does on its outgoing
+  -- side). Then drop any other stray whitespace so the payload is
+  -- guaranteed one physical line.
+  s = s:gsub("\\\n", "\\n"):gsub("\\\r", "\\r"):gsub("\n", " "):gsub("\r", " ")
+  return s .. "\n"
 end
 
 -- ---------- Session class ----------
@@ -164,13 +180,25 @@ end
 -- Note the outer single quotes around the sh -c string: the env
 -- prefix uses DOUBLE quotes for its own values specifically so that
 -- embedding works without shell quoting errors.
+-- Escape characters that have meaning inside a shell double-quoted
+-- string: backslash, dollar, backtick, and the closing double quote
+-- itself. Conditional breakpoint expressions can carry any of these.
+local function shell_escape_dq(s)
+  return (s:gsub("\\", "\\\\")
+           :gsub('"',  '\\"')
+           :gsub("`",  "\\`")
+           :gsub("%$", "\\$"))
+end
+
 function Session:env_prefix()
   local bp_parts = {}
   for _, bp in ipairs(self.breakpoints) do
-    bp_parts[#bp_parts + 1] = bp.path .. ":" .. bp.line ..
-      (bp.log and "!" or "")
+    bp_parts[#bp_parts + 1] = bp_to_spec(bp)
   end
-  local bp_env = table.concat(bp_parts, ",")
+  -- Newline separator (not comma): conditional breakpoint expressions
+  -- may contain commas (`foo(a, b)`), but never literal newlines —
+  -- conditions are single-line by construction.
+  local bp_env = shell_escape_dq(table.concat(bp_parts, "\n"))
   return string.format(
     'LUAPROBE_FIFO_OUT="%s" LUAPROBE_FIFO_IN="%s" LUAPROBE_BREAKPOINTS="%s" LUA_INIT="@%s"',
     self.out_path, self.in_path, bp_env, self.stub_path)
@@ -274,31 +302,57 @@ function Session:inspect_var(frame, kind, name)
   })
 end
 
+-- Evaluate a Lua expression in a paused frame's scope. The frame
+-- argument is optional; if omitted, the stub picks the topmost user
+-- frame. Result arrives asynchronously as an "eval" event from
+-- :poll() with shape `{event="eval", expr=..., repr=..., err=...}`.
+-- Reads on locals/upvalues see snapshot values; writes to them do
+-- not persist back into the live frame. Globals and table mutations
+-- behave normally.
+function Session:cmd_eval(expr, frame)
+  if not self.paused then return end
+  local cmd = { cmd = "eval", expr = expr or "" }
+  if frame then
+    cmd.src      = frame.source or ""
+    cmd.src_line = frame.line or 0
+  end
+  self:_send_cmd(cmd)
+end
+
 -- ---------- breakpoint management ----------
 
+-- Parse a breakpoint spec: "FILE:LINE", "FILE:LINE!", "FILE:LINE if EXPR",
+-- or "FILE:LINE! if EXPR". Returns a `bp` table or nil for malformed
+-- input. The `cond` field is a raw expression source string (or nil)
+-- and is shipped verbatim to the stub, which compiles it lazily on
+-- first hit.
 function Session:_parse_bp(spec)
   spec = spec:match("^%s*(.-)%s*$")
   if spec == "" then return nil end
+  local head, cond = spec:match("^(.-)%s+if%s+(.+)$")
+  if not head then head = spec end
   local log_only = false
-  if spec:sub(-1) == "!" then
+  if head:sub(-1) == "!" then
     log_only = true
-    spec = spec:sub(1, -2)
+    head = head:sub(1, -2)
   end
-  local path, line = spec:match("^(.-):(%d+)$")
+  local path, line = head:match("^(.-):(%d+)$")
   if not path or path == "" then return nil end
   return {
     path = path:gsub("^%./", ""),
     line = tonumber(line),
     log  = log_only,
+    cond = cond,
   }
 end
 
--- Add a breakpoint. Takes either a "FILE:LINE[!]" string or three
--- explicit arguments (path, line, log_only). If the session's child
--- is already running, the breakpoint is pushed live via add_bp.
--- Otherwise it's added to the list and will be included in the env
--- prefix the next time env_prefix() is called.
-function Session:add_breakpoint(spec_or_path, line, log_only)
+-- Add a breakpoint. Takes either a "FILE:LINE[!] [if EXPR]" string
+-- (single-arg form) or four explicit arguments (path, line, log_only,
+-- cond). If the session's child is already running, the breakpoint
+-- is pushed live via add_bp. Otherwise it's added to the list and
+-- will be included in the env prefix the next time env_prefix() is
+-- called.
+function Session:add_breakpoint(spec_or_path, line, log_only, cond)
   local bp
   if type(spec_or_path) == "string" and line == nil then
     bp = self:_parse_bp(spec_or_path)
@@ -307,6 +361,7 @@ function Session:add_breakpoint(spec_or_path, line, log_only)
       path = tostring(spec_or_path):gsub("^%./", ""),
       line = tonumber(line),
       log  = log_only or false,
+      cond = cond,
     }
   end
   if not bp then return false end
@@ -318,7 +373,7 @@ function Session:add_breakpoint(spec_or_path, line, log_only)
   self.breakpoints[#self.breakpoints + 1] = bp
   self:_send_cmd({
     cmd  = "add_bp",
-    spec = bp.path .. ":" .. bp.line .. (bp.log and "!" or ""),
+    spec = bp_to_spec(bp),
   })
   return true
 end

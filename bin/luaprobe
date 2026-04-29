@@ -28,8 +28,13 @@
 --   locals     list locals + upvalues of the current frame
 --   p NAME     deep-inspect a local or upvalue by name (prints the
 --              full recursive dump the stub produces)
+--   e EXPR     evaluate a Lua expression in the current frame; locals
+--              and upvalues are in scope, with _G as the fallback
 --   frame N    select frame index N (1 = top)
---   b FILE:L[!]  add a breakpoint at runtime
+--   b FILE:L[!] [if EXPR]
+--              add a breakpoint at runtime; ! makes it log-only,
+--              `if EXPR` makes it conditional (fires only when EXPR
+--              evaluates truthy in the breakpointed frame)
 --   d FILE:L   delete a breakpoint at runtime
 --   bps        list breakpoints
 --   q          quit (kills the target)
@@ -279,8 +284,9 @@ local function print_bps()
     return
   end
   for _, bp in ipairs(sess.breakpoints) do
-    io.write(string.format("  %s%s:%d\n",
-      bp.log and "[log] " or "[stop] ", bp.path, bp.line))
+    io.write(string.format("  %s%s:%d%s\n",
+      bp.log and "[log] " or "[stop] ", bp.path, bp.line,
+      bp.cond and ("  if " .. bp.cond) or ""))
   end
 end
 
@@ -318,8 +324,13 @@ commands:
   l [N]        list N lines of source around the current frame (default 10)
   locals       print locals + upvalues + entry values for current frame
   p NAME       deep-inspect variable NAME (local or upvalue) in current frame
+  e EXPR       evaluate Lua expression EXPR in the current frame
+               (locals/upvalues in scope, _G fallback; reads see a
+               snapshot — local writes don't persist back)
   frame N      select stack frame N (1 = topmost)
-  b FILE:L[!]  add a breakpoint (! = log-only)
+  b FILE:L[!] [if EXPR]
+               add a breakpoint; ! makes it log-only, `if EXPR` makes
+               it conditional (fires only when EXPR is truthy)
   d FILE:L     delete a breakpoint
   bps          list active breakpoints
   q, quit      quit the debugger (kills the target)
@@ -371,6 +382,21 @@ local function handle_command(input)
       io.write(string.format("%s %s = %s\n", kind, rest, reply.repr))
     else
       io.write("  (inspect: no reply from stub within timeout)\n")
+    end
+  elseif cmd == "e" or cmd == "eval" then
+    if rest == "" then
+      io.write("  usage: e <lua-expression>\n")
+      return nil
+    end
+    local frame = current_break_ev.frames[current_frame_idx]
+    sess:cmd_eval(rest, frame)
+    local reply = wait_for_event("eval", 250)
+    if not reply then
+      io.write("  (eval: no reply from stub within timeout)\n")
+    elseif reply.err then
+      io.write("  error: " .. tostring(reply.err) .. "\n")
+    else
+      io.write((reply.repr or "nil") .. "\n")
     end
   elseif cmd == "frame" then
     local n = tonumber(rest)

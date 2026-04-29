@@ -5,8 +5,13 @@
 --   LUAPROBE_FIFO_OUT — stub writes events to (stack/locals on break)
 --   LUAPROBE_FIFO_IN  — stub reads commands from (step/next/continue/...)
 --
--- Breakpoints arrive via LUAPROBE_BREAKPOINTS as a comma-separated list of
--- FILE:LINE or FILE:LINE! (the trailing ! means "log stack and continue").
+-- Breakpoints arrive via LUAPROBE_BREAKPOINTS as a newline-separated list
+-- of FILE:LINE[!] [if EXPR]. The trailing ! means "log stack and
+-- continue". The optional `if EXPR` makes the breakpoint conditional —
+-- EXPR is a Lua expression evaluated at hit time with the function's
+-- locals and upvalues in scope; the breakpoint fires only if truthy.
+-- (Comma is also accepted as a legacy separator, but breakpoint
+-- expressions can contain commas, so newline is now the canonical form.)
 --
 -- Coroutine caveat: debug.sethook is per-thread in Lua 5.1, so we
 -- monkey-patch coroutine.create / coroutine.wrap to install the hook on
@@ -54,29 +59,47 @@ local function bp_path_matches(src, path)
   return src == path or src:sub(-(#path + 1)) == "/" .. path
 end
 
-local function add_bp(spec)
+-- Parse one spec string into its parts. Accepts:
+--   FILE:LINE
+--   FILE:LINE!
+--   FILE:LINE if EXPR
+--   FILE:LINE! if EXPR
+-- Returns (path, line, log_only, cond) or nil on malformed input.
+-- Surrounding whitespace is trimmed; `cond` is nil if no `if` clause.
+local function parse_spec(spec)
+  spec = spec:match("^%s*(.-)%s*$")
+  if spec == "" then return nil end
+  local head, cond = spec:match("^(.-)%s+if%s+(.+)$")
+  if not head then head = spec end
   local log_only = false
-  if spec:sub(-1) == "!" then
+  if head:sub(-1) == "!" then
     log_only = true
-    spec = spec:sub(1, -2)
+    head = head:sub(1, -2)
   end
-  local path, line = spec:match("^(.-):(%d+)$")
-  if not path then return end
+  local path, line = head:match("^(.-):(%d+)$")
+  if not path or path == "" then return nil end
   line = tonumber(line)
   path = path:gsub("^%./", "")
+  return path, line, log_only, cond
+end
+
+local function add_bp(spec)
+  local path, line, log_only, cond = parse_spec(spec)
+  if not path then return end
   bp_list[#bp_list + 1] = {
     path          = path,
     requested     = line,
     mode          = log_only and "log" or "stop",
     resolved_line = nil,
+    cond          = cond,           -- raw expression source, or nil
+    cond_compiled = nil,            -- nil = not yet tried, false = compile failed,
+                                    -- function = compiled chunk
   }
 end
 
 local function del_bp_spec(spec)
-  local path, line = spec:match("^(.-):(%d+)$")
+  local path, line = parse_spec(spec)
   if not path then return end
-  path = path:gsub("^%./", "")
-  line = tonumber(line)
   for i, bp in ipairs(bp_list) do
     if bp.path == path and bp.requested == line then
       table.remove(bp_list, i)
@@ -85,9 +108,10 @@ local function del_bp_spec(spec)
   end
 end
 
-for item in bps_env:gmatch("[^,]+") do
-  item = item:match("^%s*(.-)%s*$")
-  if item ~= "" then add_bp(item) end
+-- Split env on newline first (canonical), then on comma (legacy).
+local sep = bps_env:find("\n", 1, true) and "\n" or ","
+for item in bps_env:gmatch("[^" .. sep .. "]+") do
+  if item:match("%S") then add_bp(item) end
 end
 
 -- In main chunks, snapping is disabled entirely: the requested line
@@ -112,7 +136,7 @@ local function lookup_bp(src, line, info)
   for _, bp in ipairs(bp_list) do
     if bp_path_matches(src, bp.path) then
       if bp.resolved_line then
-        if bp.resolved_line == line then return bp.mode end
+        if bp.resolved_line == line then return bp.mode, bp end
       elseif line >= bp.requested then
         local range_ok = false
         if info and info.what == "Lua" then
@@ -139,7 +163,7 @@ local function lookup_bp(src, line, info)
                   " -> actual executable line " .. line ..
                   " (what=" .. tostring(info and info.what) .. ")")
           end
-          return bp.mode
+          return bp.mode, bp
         end
       end
     end
@@ -299,6 +323,63 @@ local function find_entry_locals(co, target_func)
     end
   end
   return nil
+end
+
+-- ---------- expression evaluation ----------
+-- Shared between conditional breakpoints (evaluated in line_hook before
+-- pausing) and the `eval` command (evaluated inside pause's command
+-- loop). Both want the same thing: a Lua env table populated from the
+-- target frame's locals and upvalues, with _G as the fallback.
+--
+-- `level` is the absolute stack level of the user frame to view, as
+-- seen from build_eval_env's own POV. Caller is responsible for passing
+-- the right number — see the two call sites for the offset math.
+local function build_eval_env(level)
+  local set, env = {}, {}
+  local i = 1
+  while true do
+    local n, v = debug.getlocal(level, i)
+    if not n then break end
+    if n:sub(1, 1) ~= "(" then
+      env[n] = v
+      set[n] = true
+    end
+    i = i + 1
+  end
+  local info = debug.getinfo(level, "f")
+  if info and info.func then
+    i = 1
+    while true do
+      local n, v = debug.getupvalue(info.func, i)
+      if not n then break end
+      if not set[n] then env[n] = v; set[n] = true end
+      i = i + 1
+    end
+  end
+  return setmetatable(env, { __index = _G }), info
+end
+
+-- Evaluate a breakpoint condition at the given level. Compile lazily
+-- on first hit. Compile failures and runtime errors both result in
+-- "don't fire" (silent) — a misconfigured condition shouldn't pause
+-- the program in surprising places. Compile failures are traced once.
+local function eval_bp_condition(bp, level)
+  if bp.cond_compiled == nil then
+    local chunk, err = loadstring("return (" .. bp.cond .. ")", "=cond")
+    if chunk then
+      bp.cond_compiled = chunk
+    else
+      bp.cond_compiled = false
+      trace("bp condition compile failed for " .. bp.path .. ":"
+            .. tostring(bp.requested) .. ": " .. tostring(err))
+    end
+  end
+  if not bp.cond_compiled then return false end
+  local env = build_eval_env(level)
+  setfenv(bp.cond_compiled, env)
+  local ok, val = pcall(bp.cond_compiled)
+  if not ok then return false end
+  return val and true or false
 end
 
 -- ---------- step state ----------
@@ -580,6 +661,90 @@ local function pause(reason, line, frames, locals_by_frame)
         repr  = repr,
       })
       -- fall through: keep reading commands
+    elseif cmd == "eval" then
+      -- Evaluate a user expression in the scope of one of the
+      -- currently-paused frames. Frame is identified by (src,
+      -- src_line) the same way the inspect command does it; if
+      -- absent, defaults to the topmost user (Lua/main) frame.
+      --
+      -- The expression is compiled first as `return (EXPR)` so plain
+      -- expressions return their value; if that fails (i.e. the
+      -- input is a statement like `x = 5` or `print('hi')`), we fall
+      -- back to compiling the raw text as a chunk and the reply
+      -- carries no `repr`. Errors at any stage come back via `err`.
+      --
+      -- Reads on locals/upvalues hit the snapshot env; writes to
+      -- locals/upvalues do NOT persist back to the live frame
+      -- (intentional simplification — writes to globals and mutations
+      -- through tables work normally because they go through
+      -- references that survive the snapshot).
+      local expr = msg.expr or ""
+      local want_src  = msg.src
+      local want_line = msg.src_line
+      local target_level
+
+      if want_src and want_src ~= "" then
+        local cand = want_src:gsub("^%./", "")
+        for lvl = 2, 40 do
+          local info = debug.getinfo(lvl, "Sl")
+          if not info then break end
+          local s = info.source or ""
+          if s:sub(1, 1) == "@" then s = s:sub(2):gsub("^%./", "") end
+          if (s == cand or s:sub(-(#cand + 1)) == "/" .. cand)
+             and info.currentline == want_line then
+            target_level = lvl
+            break
+          end
+        end
+      end
+      if not target_level then
+        -- Fallback: first Lua/main frame above us. Skip C frames and
+        -- the stub's own frames (the stub's source starts with `=cond`
+        -- or its file path; skipping by `what` is enough in practice).
+        for lvl = 2, 40 do
+          local info = debug.getinfo(lvl, "S")
+          if not info then break end
+          if info.what == "Lua" or info.what == "main" then
+            target_level = lvl
+            break
+          end
+        end
+      end
+
+      local repr, err
+      if not target_level then
+        err = "no live frame to eval in"
+      else
+        -- build_eval_env is one normal call deeper than us, so user
+        -- code is at target_level + 1 from inside it.
+        local env = build_eval_env(target_level + 1)
+        local chunk, cerr = loadstring("return (" .. expr .. ")", "=eval")
+        if not chunk then
+          chunk, cerr = loadstring(expr, "=eval")
+        end
+        if not chunk then
+          err = "compile: " .. tostring(cerr)
+        else
+          setfenv(chunk, env)
+          local ok, val = pcall(chunk)
+          if not ok then
+            err = "runtime: " .. tostring(val)
+          else
+            local sok, srepr = pcall(serialize, val, 0, {},
+              DEEP_MAX_DEPTH, DEEP_MAX_KEYS, DEEP_MAX_STR)
+            repr = sok and srepr or
+              ("<serialize error: " .. tostring(srepr) .. ">")
+          end
+        end
+      end
+
+      send({
+        event = "eval",
+        expr  = expr,
+        repr  = repr,
+        err   = err,
+      })
+      -- fall through: keep reading commands
     elseif cmd == "add_bp" then
       add_bp(msg.spec or "")
     elseif cmd == "del_bp" then
@@ -693,8 +858,23 @@ local function line_hook(event, line)
     end
   end
 
-  local hit = lookup_bp(src, line, info)
+  local hit, bp = lookup_bp(src, line, info)
   if hit then
+    -- Conditional breakpoints: evaluate `bp.cond` against the user
+    -- frame's locals/upvalues. A falsy result (or any error during
+    -- compile/eval) silently skips this hit. Stack levels here:
+    --   level 2 from line_hook    = user code
+    --   level 4 from build_eval_env = user code
+    -- (line_hook → eval_bp_condition → build_eval_env, two normal
+    -- call frames between the hook and the env builder.) The
+    -- in_hook guard suppresses recursive line events while the
+    -- condition's own Lua code runs.
+    if bp.cond then
+      in_hook = true
+      local cond_ok = eval_bp_condition(bp, 4)
+      in_hook = false
+      if not cond_ok then return end
+    end
     -- Collect stack FIRST so we have a stable anchor (level 2 from
     -- here is user code, confirmed). Then call pause with the result
     -- as a NORMAL call (not a tail call — tail calls replace the
