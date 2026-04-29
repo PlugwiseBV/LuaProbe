@@ -4,7 +4,7 @@
     <br />
     <br />
     <a href="https://plugwise.com">
-      <img src="https://plugwise.com/img/luaprobe.svg" alt="Plugwise">
+      <img src="https://plugwise.com/img/luaprobe-readme.svg" alt="Plugwise">
     </a>
   </h1>
 </div>
