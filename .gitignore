@@ -3,5 +3,5 @@
 *~
 .DS_Store
 # Runtime artifacts
-/tmp/pwdebug-*
-pwdebug-debugger.log
+/tmp/luaprobe-*
+luaprobe.log

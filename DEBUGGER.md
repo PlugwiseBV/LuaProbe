@@ -1,4 +1,4 @@
-# pwdebug Lua debugger
+# luaprobe Lua debugger
 
 A source-level debugger for Lua 5.1 / LuaJIT programs, built around the
 standard `debug` library. The debugged process runs under `luajit` (or
@@ -34,7 +34,7 @@ Nothing else. No `luaposix`, no `luasocket`, no C extensions.
 There is no install step. The debugger is two files:
 
 ```
-pwdebug_stub.lua     ← copy next to your controller
+luaprobe_stub.lua     ← copy next to your controller
 src/debugger.lua     ← the controller-side module
 ```
 
@@ -73,12 +73,12 @@ ffi.cdef[[
 local O_RDONLY, O_RDWR, O_NONBLOCK = 0, 2, 2048
 
 -- Where the stub lives, absolute path.
-local STUB = "/absolute/path/to/pwdebug_stub.lua"
+local STUB = "/absolute/path/to/luaprobe_stub.lua"
 
 -- 1. Generate unique FIFO paths.
 local id = tostring(os.time())
-local out_path = "/tmp/pwdebug-" .. id .. ".out"  -- child → controller
-local in_path  = "/tmp/pwdebug-" .. id .. ".in"   -- controller → child
+local out_path = "/tmp/luaprobe-" .. id .. ".out"  -- child → controller
+local in_path  = "/tmp/luaprobe-" .. id .. ".in"   -- controller → child
 
 -- 2. mkfifo both.
 os.execute("rm -f " .. out_path .. " " .. in_path)
@@ -95,7 +95,7 @@ assert(fd_out >= 0 and fd_in >= 0, "fifo open failed")
 --    single-quoted sh -c string.
 local target = arg[1] or "demo.lua"
 local cmd = string.format(
-  [[sh -c 'PWDEBUG_FIFO_OUT="%s" PWDEBUG_FIFO_IN="%s" PWDEBUG_BREAKPOINTS="%s" LUA_INIT="@%s" lua5.1 %s' &]],
+  [[sh -c 'LUAPROBE_FIFO_OUT="%s" LUAPROBE_FIFO_IN="%s" LUAPROBE_BREAKPOINTS="%s" LUA_INIT="@%s" lua5.1 %s' &]],
   out_path, in_path, "demo.lua:4", STUB, target)
 print("launching:", cmd)
 os.execute(cmd)
@@ -202,7 +202,7 @@ single line of Lua literals, the controller prints them, sends
 
 ### Breakpoint syntax cheat sheet
 
-Set via the `PWDEBUG_BREAKPOINTS` env var as a comma-separated list:
+Set via the `LUAPROBE_BREAKPOINTS` env var as a comma-separated list:
 
 | spec | meaning |
 |---|---|
@@ -228,10 +228,10 @@ via `LUA_INIT`, so anything that ultimately runs `lua5.1` or `luajit`
 with that env var set gets debugged:
 
 ```sh
-PWDEBUG_FIFO_OUT=/tmp/pwdebug.out \
-PWDEBUG_FIFO_IN=/tmp/pwdebug.in \
-PWDEBUG_BREAKPOINTS=src/foo.lua:42 \
-LUA_INIT=@/abs/path/to/pwdebug_stub.lua \
+LUAPROBE_FIFO_OUT=/tmp/luaprobe.out \
+LUAPROBE_FIFO_IN=/tmp/luaprobe.in \
+LUAPROBE_BREAKPOINTS=src/foo.lua:42 \
+LUA_INIT=@/abs/path/to/luaprobe_stub.lua \
 ./my_test_runner some_scenario.lua
 ```
 
@@ -257,10 +257,10 @@ mkfifo /tmp/p.in /tmp/p.out
 (tail -f /tmp/p.out &) ; sleep 0.1
 
 # Terminal 2
-PWDEBUG_FIFO_OUT=/tmp/p.out \
-PWDEBUG_FIFO_IN=/tmp/p.in \
-PWDEBUG_BREAKPOINTS=demo.lua:4 \
-LUA_INIT="@$PWD/pwdebug_stub.lua" \
+LUAPROBE_FIFO_OUT=/tmp/p.out \
+LUAPROBE_FIFO_IN=/tmp/p.in \
+LUAPROBE_BREAKPOINTS=demo.lua:4 \
+LUA_INIT="@$PWD/luaprobe_stub.lua" \
 lua5.1 demo.lua
 ```
 
@@ -272,7 +272,7 @@ a resume command — kill it with Ctrl-C.
 
 If you see the `hello` but no `break`, either the line you picked
 never executes, or `debug.getinfo` is reporting a different source
-path than you typed. Check `/tmp/pwdebug-debugger.log` — the stub
+path than you typed. Check `/tmp/luaprobe.log` — the stub
 logs every unique source it sees and every near-match file+line
 hit. The diagnostic workflow in *Debugging the debugger* at the
 bottom of this doc walks through which log pattern maps to which
@@ -287,7 +287,7 @@ class of bug.
   │     Controller process    │          │      Debugged process     │
   │      (LuaJIT, TUI-ish)    │          │       (lua5.1 /luajit)    │
   │                           │          │                           │
-  │   src/debugger.lua        │          │   pwdebug_stub.lua        │
+  │   src/debugger.lua        │          │   luaprobe_stub.lua        │
   │   • owns two FIFO fds     │          │   • line + call + return  │
   │   • poll()s them each     │          │     hook installed via    │
   │     tick (non-blocking)   │          │     debug.sethook         │
@@ -319,12 +319,12 @@ Two processes, two FIFOs, one line-oriented Lua-literal protocol.
 
 ### Rendezvous sequence
 
-1. Controller generates two unique paths in `/tmp/pwdebug-<id>.{in,out}`.
+1. Controller generates two unique paths in `/tmp/luaprobe-<id>.{in,out}`.
 2. Controller `mkfifo`s both.
 3. Controller opens its ends (`O_RDWR | O_NONBLOCK` on the in-fifo,
    `O_RDONLY | O_NONBLOCK` on the out-fifo).
 4. Controller `fork+exec`s the debugged process with
-   `LUA_INIT=@/abs/path/pwdebug_stub.lua` and two env vars pointing at
+   `LUA_INIT=@/abs/path/luaprobe_stub.lua` and two env vars pointing at
    the FIFO paths.
 5. Stub runs, opens `fifo_out` for writing (blocks if the controller
    isn't ready — but it is, from step 3). Opens `fifo_in` for reading.
@@ -336,7 +336,7 @@ Two processes, two FIFOs, one line-oriented Lua-literal protocol.
 
 ---
 
-## The stub (`pwdebug_stub.lua`)
+## The stub (`luaprobe_stub.lua`)
 
 Pure Lua 5.1, no C extensions, no LuaJIT-specific features. Designed
 to be loaded into an arbitrary Lua 5.1 interpreter via `LUA_INIT` and
@@ -345,9 +345,9 @@ quietly attach a debugger.
 ### Entry
 
 ```lua
-local fifo_out_path = os.getenv("PWDEBUG_FIFO_OUT")
-local fifo_in_path  = os.getenv("PWDEBUG_FIFO_IN")
-local bps_env       = os.getenv("PWDEBUG_BREAKPOINTS") or ""
+local fifo_out_path = os.getenv("LUAPROBE_FIFO_OUT")
+local fifo_in_path  = os.getenv("LUAPROBE_FIFO_IN")
+local bps_env       = os.getenv("LUAPROBE_BREAKPOINTS") or ""
 ```
 
 If either FIFO path is missing or empty, the stub returns immediately
@@ -359,7 +359,7 @@ If either FIFO path is missing or empty, the stub returns immediately
 Breakpoints arrive as a comma-separated list:
 
 ```
-PWDEBUG_BREAKPOINTS="core/foo.lua:42,core/bar.lua:88!"
+LUAPROBE_BREAKPOINTS="core/foo.lua:42,core/bar.lua:88!"
 ```
 
 `FILE:LINE` is a **stop** breakpoint; the trailing `!` makes it a
@@ -818,8 +818,8 @@ debugged child process:
 4. Builds the env-var prefix string to inject into the child's
    launch command:
    ```
-   PWDEBUG_FIFO_OUT="..." PWDEBUG_FIFO_IN="..." \
-   PWDEBUG_BREAKPOINTS="..." LUA_INIT="@/abs/path/pwdebug_stub.lua"
+   LUAPROBE_FIFO_OUT="..." LUAPROBE_FIFO_IN="..." \
+   LUAPROBE_BREAKPOINTS="..." LUA_INIT="@/abs/path/luaprobe_stub.lua"
    ```
    **Quoting:** the caller embeds this prefix inside a shell wrapper
    that uses single quotes (`sh -c '...'`), so the prefix must use
@@ -879,7 +879,7 @@ of them block; the effects arrive (or don't) via the next `poll()`.
 
 ## Debugging the debugger
 
-Every significant event is logged to `/tmp/pwdebug-debugger.log` by
+Every significant event is logged to `/tmp/luaprobe.log` by
 both sides, in append mode:
 
 - Controller logs session start with all the env-var and path
@@ -897,7 +897,7 @@ Typical diagnostic workflow:
 
 1. No `[stub ...]` lines at all → stub never loaded. Either the
    child's `lua`/`luajit` invocation isn't honoring `LUA_INIT`, or
-   the child is a non-Lua process. Check `PWDEBUG_FIFO_*` env vars
+   the child is a non-Lua process. Check `LUAPROBE_FIFO_*` env vars
    reached the interpreter.
 2. `[stub ...] loaded` but nothing after → FIFO open failed.
    Controller didn't have both ends open at spawn time.
@@ -982,7 +982,7 @@ Typical diagnostic workflow:
     so that accidentally referencing an undeclared local (which Lua
     resolves to a nil global) errors at access time instead of
     failing mysteriously at runtime.
-13. **FIFO transport is local-only.** `/tmp/pwdebug-*.{in,out}`
+13. **FIFO transport is local-only.** `/tmp/luaprobe-*.{in,out}`
     only works when both processes are on the same host. No network
     transparency.
 
@@ -991,8 +991,8 @@ Typical diagnostic workflow:
 ## Files
 
 ```
-pwdebug_stub.lua      child-side debugger, plain Lua 5.1, loaded
-                      via LUA_INIT=@<abs>/pwdebug_stub.lua
+luaprobe_stub.lua      child-side debugger, plain Lua 5.1, loaded
+                      via LUA_INIT=@<abs>/luaprobe_stub.lua
 
 src/debugger.lua      controller-side session manager, LuaJIT only
                       (FFI for non-blocking FIFO I/O)
@@ -1016,10 +1016,10 @@ Set by the controller when spawning a debugged process:
 
 | var | purpose |
 |-----|---------|
-| `PWDEBUG_FIFO_OUT` | abs path; child writes events to it (controller reads) |
-| `PWDEBUG_FIFO_IN`  | abs path; child reads commands from it (controller writes) |
-| `PWDEBUG_BREAKPOINTS` | comma-separated `FILE:LINE[!]` list |
-| `LUA_INIT` | `@<abs path to pwdebug_stub.lua>` — how the stub gets loaded |
+| `LUAPROBE_FIFO_OUT` | abs path; child writes events to it (controller reads) |
+| `LUAPROBE_FIFO_IN`  | abs path; child reads commands from it (controller writes) |
+| `LUAPROBE_BREAKPOINTS` | comma-separated `FILE:LINE[!]` list |
+| `LUA_INIT` | `@<abs path to luaprobe_stub.lua>` — how the stub gets loaded |
 
-The stub silently no-ops if `PWDEBUG_FIFO_OUT` is unset or empty, so
+The stub silently no-ops if `LUAPROBE_FIFO_OUT` is unset or empty, so
 installing it globally via `LUA_INIT` in your shell is safe.

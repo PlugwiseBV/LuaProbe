@@ -1,18 +1,18 @@
-# pwdebug-lua
+# LuaProbe
 
 A source-level debugger for Lua 5.1 / LuaJIT programs, implemented as
 two small files you drop into any project. No C extensions, no
 luasocket, no luaposix — just the Lua standard library on the child
 side and LuaJIT FFI on the controller side.
 
-- **`pwdebug_stub.lua`** — plain Lua 5.1, loaded into the target
+- **`luaprobe_stub.lua`** — plain Lua 5.1, loaded into the target
   process via `LUA_INIT`. Installs a line hook, coroutine hooks, and
   call/return hooks; talks to the controller over two FIFOs.
-- **`pwdebug.lua`** — LuaJIT-only controller library. Creates the
+- **`luaprobe.lua`** — LuaJIT-only controller library. Creates the
   FIFOs, spawns the debugged child with the right env vars, decodes
   events, sends commands.
-- **`bin/pwdebug`** — a simple interactive CLI built on the library.
-  Run it like `gdb`: `pwdebug -b foo.lua:42 foo.lua`.
+- **`bin/luaprobe`** — a simple interactive CLI built on the library.
+  Run it like `gdb`: `luaprobe -b foo.lua:42 foo.lua`.
 
 What you get:
 
@@ -50,11 +50,11 @@ No other dependencies.
 Copy the two files into your project:
 
 ```sh
-cp pwdebug_stub.lua pwdebug.lua /wherever/you/want/
+cp luaprobe_stub.lua luaprobe.lua /wherever/you/want/
 ```
 
-There is no install step. `pwdebug.lua` is `require`d from your
-controller; `pwdebug_stub.lua` is passed as an absolute path via
+There is no install step. `luaprobe.lua` is `require`d from your
+controller; `luaprobe_stub.lua` is passed as an absolute path via
 `LUA_INIT`.
 
 ---
@@ -64,8 +64,8 @@ controller; `pwdebug_stub.lua` is passed as an absolute path via
 Say this is the program you want to debug (`examples/demo.lua`):
 
 ```lua
--- demo.lua — target program for the pwdebug quickstart.
--- Try: bin/pwdebug -b demo.lua:7 examples/demo.lua
+-- demo.lua — target program for the luaprobe quickstart.
+-- Try: bin/luaprobe -b demo.lua:7 examples/demo.lua
 
 local function greet(name, times)
   local message = "hello, " .. name   -- line 5
@@ -77,23 +77,23 @@ end
 greet("world", 3)
 ```
 
-### Quickest way: the `pwdebug` CLI
+### Quickest way: the `luaprobe` CLI
 
-A simple interactive debugger ships in `bin/pwdebug`. Run it like
+A simple interactive debugger ships in `bin/luaprobe`. Run it like
 `gdb`:
 
 ```sh
-bin/pwdebug -b demo.lua:7 examples/demo.lua
+bin/luaprobe -b demo.lua:7 examples/demo.lua
 ```
 
 It spawns the target, waits for the breakpoint, drops you into a
 REPL each time it fires:
 
 ```
-pwdebug: launching: lua5.1 examples/demo.lua
-pwdebug:   breakpoint: demo.lua:7
-pwdebug: waiting for events (Ctrl-C to quit)
-pwdebug: child attached
+luaprobe: launching: lua5.1 examples/demo.lua
+luaprobe:   breakpoint: demo.lua:7
+luaprobe: waiting for events (Ctrl-C to quit)
+luaprobe: child attached
 
 *** BREAK at examples/demo.lua:7  [main]  (reason=stop)
 * #1  greet                    examples/demo.lua:7
@@ -105,12 +105,12 @@ locals:
   times = 3
   message = "hello, world"
   i = 1
-(pwdebug) p message
+(luaprobe) p message
 local message = "hello, world"
-(pwdebug) c
+(luaprobe) c
 
 *** BREAK at examples/demo.lua:7  ...
-(pwdebug) c
+(luaprobe) c
 ...
 ```
 
@@ -118,7 +118,7 @@ Commands: `c`/`s`/`n`/`f` (continue/step/next/finish), `bt` (stack),
 `l [N]` (source around the current line), `locals`, `p NAME` (deep
 inspect a variable), `frame N` (select frame), `b FILE:L[!]` /
 `d FILE:L` (add/remove breakpoint), `bps` (list breakpoints), `q`.
-Type `help` for the full list. Run `pwdebug --help` for CLI options.
+Type `help` for the full list. Run `luaprobe --help` for CLI options.
 
 ### Build your own: the library API
 
@@ -129,20 +129,20 @@ same thing, so you can see the full loop in one place
 
 ```lua
 #!/usr/bin/env luajit
--- Minimal pwdebug controller — break at demo.lua:4, print stack
+-- Minimal luaprobe controller — break at demo.lua:4, print stack
 -- and locals, continue. About 50 lines of real code.
 
-local pwdebug = require("pwdebug")
+local luaprobe = require("luaprobe")
 
 local here = arg[0]:match("(.*/)") or "./"
-local stub = here .. "../pwdebug_stub.lua"
+local stub = here .. "../luaprobe_stub.lua"
 local stub_abs = io.popen("realpath " .. stub):read("*l")
 
-local sess, err = pwdebug.new({
+local sess, err = luaprobe.new({
   stub_path    = stub_abs,
   breakpoints  = { "demo.lua:4" },
   source_roots = { here },
-  on_status    = function(msg) io.stderr:write("[pwdebug] " .. msg .. "\n") end,
+  on_status    = function(msg) io.stderr:write("[luaprobe] " .. msg .. "\n") end,
 })
 assert(sess, err)
 
@@ -189,7 +189,7 @@ luajit mini_controller.lua
 You'll see something like:
 
 ```
-launching: sh -c 'PWDEBUG_FIFO_OUT=... lua5.1 ./demo.lua' &
+launching: sh -c 'LUAPROBE_FIFO_OUT=... lua5.1 ./demo.lua' &
 waiting for events...
 child attached; breakpoints: demo.lua:4
 
@@ -216,21 +216,21 @@ decodes it, prints what it wants, and sends a `continue` command.
 
 ## API
 
-### `pwdebug.new(opts) -> session | nil, err`
+### `luaprobe.new(opts) -> session | nil, err`
 
 Creates a new debug session. Returns a session object or `(nil,
 errmsg)` on failure.
 
 ```lua
-local sess = pwdebug.new({
-  stub_path    = "/abs/path/to/pwdebug_stub.lua",  -- required
+local sess = luaprobe.new({
+  stub_path    = "/abs/path/to/luaprobe_stub.lua",  -- required
   breakpoints  = { "src/foo.lua:42", "bar.lua:88!" },
   source_roots = { ".", "src" },
   on_status    = function(msg) print("[dbg] " .. msg) end,
 })
 ```
 
-**`stub_path`** (required) — absolute path to `pwdebug_stub.lua`.
+**`stub_path`** (required) — absolute path to `luaprobe_stub.lua`.
 The session will inject this into the child's `LUA_INIT`.
 
 **`breakpoints`** (optional) — initial breakpoint specs as an array
@@ -250,7 +250,7 @@ Returns the shell env-var prefix to inject into your child-process
 launch command. The string includes:
 
 ```
-PWDEBUG_FIFO_OUT="..." PWDEBUG_FIFO_IN="..." PWDEBUG_BREAKPOINTS="..." LUA_INIT="@..."
+LUAPROBE_FIFO_OUT="..." LUAPROBE_FIFO_IN="..." LUAPROBE_BREAKPOINTS="..." LUA_INIT="@..."
 ```
 
 All values are **double-quoted** so the string can be safely embedded
@@ -262,7 +262,7 @@ os.execute(cmd)
 ```
 
 The controller end of the FIFOs must already be open at the point
-you spawn the child — `pwdebug.new()` handles that for you. Don't
+you spawn the child — `luaprobe.new()` handles that for you. Don't
 sleep or do blocking work between `new()` and your `os.execute`.
 
 ### `session:poll() -> events_array`
@@ -358,7 +358,7 @@ event has an `event` field identifying its shape.
 ### `{ event = "hello", bps = "..." }`
 
 Emitted once when the stub finishes initializing. `bps` is the raw
-string that was passed via `PWDEBUG_BREAKPOINTS`, for logging.
+string that was passed via `LUAPROBE_BREAKPOINTS`, for logging.
 
 ### `{ event = "break", ... }`
 
@@ -453,18 +453,18 @@ asynchronously as events from `:poll()`.
 
 ## Debugging the debugger
 
-Both sides log to `/tmp/pwdebug-debugger.log` (append mode). Useful
+Both sides log to `/tmp/luaprobe.log` (append mode). Useful
 patterns:
 
 ```sh
 # See every event the stub has sent
-grep SEND /tmp/pwdebug-debugger.log
+grep SEND /tmp/luaprobe.log
 
 # See every source the hook has encountered at runtime
-grep 'new source seen' /tmp/pwdebug-debugger.log
+grep 'new source seen' /tmp/luaprobe.log
 
 # See why a breakpoint might not be firing
-grep 'near-match\|snap bp\|break reason' /tmp/pwdebug-debugger.log
+grep 'near-match\|snap bp\|break reason' /tmp/luaprobe.log
 ```
 
 See `DEBUGGER.md` for a detailed diagnostic flowchart mapping log

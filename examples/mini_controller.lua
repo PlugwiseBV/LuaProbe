@@ -1,5 +1,5 @@
 #!/usr/bin/env luajit
--- Minimal pwdebug controller.
+-- Minimal luaprobe controller.
 --
 -- Spawns ./demo.lua with a breakpoint at line 4, prints the stack
 -- and locals whenever it pauses, then continues. Run as:
@@ -13,26 +13,26 @@
 --
 -- No UI framework, no curses — just plain stdout.
 
--- Find ../pwdebug.lua so we can require it without installing.
+-- Find ../luaprobe.lua so we can require it without installing.
 local here = arg[0]:match("(.*/)") or "./"
 package.path = here .. "../?.lua;" .. package.path
 
-local pwdebug = require("pwdebug")
+local luaprobe = require("luaprobe")
 
 -- Absolute path to the stub (LUA_INIT needs an absolute path).
 local stub_abs
 do
-  local f = io.popen("realpath '" .. here .. "../pwdebug_stub.lua'")
+  local f = io.popen("realpath '" .. here .. "../luaprobe_stub.lua'")
   stub_abs = f:read("*l")
   f:close()
 end
 
-local sess, err = pwdebug.new({
+local sess, err = luaprobe.new({
   stub_path    = stub_abs,
   breakpoints  = { "demo.lua:7" },
   source_roots = { here },
   on_status    = function(msg)
-    io.stderr:write("[pwdebug] " .. msg .. "\n")
+    io.stderr:write("[luaprobe] " .. msg .. "\n")
   end,
 })
 assert(sess, err)

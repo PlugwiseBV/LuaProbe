@@ -1,11 +1,11 @@
--- pwdebug_stub.lua — child-side debugger stub.
+-- luaprobe_stub.lua — child-side debugger stub.
 --
--- Loaded into the debugged Lua 5.1 process via LUA_INIT=@<abs>/pwdebug_stub.lua.
--- Talks to the pwdebug TUI over two FIFOs:
---   PWDEBUG_FIFO_OUT — stub writes events to (stack/locals on break)
---   PWDEBUG_FIFO_IN  — stub reads commands from (step/next/continue/...)
+-- Loaded into the debugged Lua 5.1 process via LUA_INIT=@<abs>/luaprobe_stub.lua.
+-- Talks to the luaprobe TUI over two FIFOs:
+--   LUAPROBE_FIFO_OUT — stub writes events to (stack/locals on break)
+--   LUAPROBE_FIFO_IN  — stub reads commands from (step/next/continue/...)
 --
--- Breakpoints arrive via PWDEBUG_BREAKPOINTS as a comma-separated list of
+-- Breakpoints arrive via LUAPROBE_BREAKPOINTS as a comma-separated list of
 -- FILE:LINE or FILE:LINE! (the trailing ! means "log stack and continue").
 --
 -- Coroutine caveat: debug.sethook is per-thread in Lua 5.1, so we
@@ -15,14 +15,14 @@
 -- Pure Lua 5.1, no FFI, no luasocket. Blocking reads on the in-FIFO are
 -- intentional — "paused at breakpoint" means the thread is blocked.
 
-local fifo_out_path = os.getenv("PWDEBUG_FIFO_OUT")
-local fifo_in_path  = os.getenv("PWDEBUG_FIFO_IN")
-local bps_env       = os.getenv("PWDEBUG_BREAKPOINTS") or ""
+local fifo_out_path = os.getenv("LUAPROBE_FIFO_OUT")
+local fifo_in_path  = os.getenv("LUAPROBE_FIFO_IN")
+local bps_env       = os.getenv("LUAPROBE_BREAKPOINTS") or ""
 
 -- Launch trace. Open append-mode so multi-coroutine / multi-process
 -- loads don't clobber each other. Silently ignore if /tmp is unwritable.
 local function trace(msg)
-  local f = io.open("/tmp/pwdebug-debugger.log", "a")
+  local f = io.open("/tmp/luaprobe.log", "a")
   if not f then return end
   f:write("[stub ", tostring(os.time()), "] ", msg, "\n")
   f:close()
@@ -160,9 +160,9 @@ trace("fifos opened, hook installed")
 -- ---------- Lua-literal serializer ----------
 -- Variable-value serialization: shallow, so break events don't balloon
 -- when a local happens to be a giant pwcore table.
-local MAX_DEPTH = 2
-local MAX_KEYS  = 50
-local MAX_STR   = 400
+local MAX_DEPTH = 3
+local MAX_KEYS  = 100
+local MAX_STR   = 2000
 -- Deep mode for on-demand `inspect`: walks much further so the TUI can
 -- render a full dump of a specific variable the user clicked on.
 local DEEP_MAX_DEPTH = 6

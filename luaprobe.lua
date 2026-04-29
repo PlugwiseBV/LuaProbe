@@ -1,4 +1,4 @@
--- pwdebug — controller-side library for the pwdebug Lua debugger.
+-- luaprobe — controller-side library for the luaprobe Lua debugger.
 --
 -- This module owns the two-FIFO transport, the Lua-literal decoder,
 -- and the session lifecycle. It has NO global state and no
@@ -81,8 +81,8 @@ local session_counter = 0
 local function fresh_paths()
   session_counter = session_counter + 1
   local id = tostring(os.time()) .. "-" .. tostring(session_counter)
-  return "/tmp/pwdebug-" .. id .. ".out",
-         "/tmp/pwdebug-" .. id .. ".in"
+  return "/tmp/luaprobe-" .. id .. ".out",
+         "/tmp/luaprobe-" .. id .. ".in"
 end
 
 -- Public constructor. Creates the FIFOs, opens the TUI-side ends
@@ -90,7 +90,7 @@ end
 -- prefix injected into a child-process launch command.
 --
 -- opts:
---   stub_path     (required) absolute path to pwdebug_stub.lua
+--   stub_path     (required) absolute path to luaprobe_stub.lua
 --   breakpoints   (optional) array of "FILE:LINE[!]" strings
 --   on_status     (optional) callback(string) for status messages
 --                 (decode errors, session lifecycle, etc.)
@@ -98,9 +98,9 @@ end
 --                 `session:get_source(path)` needs to load a file
 --                 for display. Defaults to {"."}.
 function M.new(opts)
-  assert(type(opts) == "table", "pwdebug.new requires an options table")
+  assert(type(opts) == "table", "luaprobe.new requires an options table")
   assert(type(opts.stub_path) == "string" and #opts.stub_path > 0,
-    "pwdebug.new: opts.stub_path is required")
+    "luaprobe.new: opts.stub_path is required")
 
   local self = setmetatable({}, Session)
   self.stub_path    = opts.stub_path
@@ -172,7 +172,7 @@ function Session:env_prefix()
   end
   local bp_env = table.concat(bp_parts, ",")
   return string.format(
-    'PWDEBUG_FIFO_OUT="%s" PWDEBUG_FIFO_IN="%s" PWDEBUG_BREAKPOINTS="%s" LUA_INIT="@%s"',
+    'LUAPROBE_FIFO_OUT="%s" LUAPROBE_FIFO_IN="%s" LUAPROBE_BREAKPOINTS="%s" LUA_INIT="@%s"',
     self.out_path, self.in_path, bp_env, self.stub_path)
 end
 

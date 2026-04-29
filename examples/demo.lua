@@ -1,5 +1,5 @@
--- demo.lua — target program for the pwdebug quickstart.
--- Try: bin/pwdebug -b demo.lua:5 examples/demo.lua
+-- demo.lua — target program for the luaprobe quickstart.
+-- Try: bin/luaprobe -b demo.lua:5 examples/demo.lua
 
 local function greet(name, times)
   local message = "hello, " .. name   -- line 5

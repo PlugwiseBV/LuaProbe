@@ -1,10 +1,10 @@
 #!/usr/bin/env luajit
--- pwdebug — simple interactive command-line debugger for Lua 5.1 /
--- LuaJIT programs. Wraps the pwdebug library with a plain REPL; no
+-- luaprobe — simple interactive command-line debugger for Lua 5.1 /
+-- LuaJIT programs. Wraps the luaprobe library with a plain REPL; no
 -- curses, no ncurses, just stdout and io.read.
 --
 -- Usage:
---   pwdebug [options] <target.lua> [target_args...]
+--   luaprobe [options] <target.lua> [target_args...]
 --
 -- Options:
 --   -b, --break FILE:LINE[!]   set a breakpoint (repeatable); trailing
@@ -13,10 +13,10 @@
 --                              files for display (repeatable, default .)
 --   -i, --interp CMD           interpreter to run the target with
 --                              (default: lua5.1)
---       --stub PATH            override path to pwdebug_stub.lua
+--       --stub PATH            override path to luaprobe_stub.lua
 --   -h, --help                 this message
 --
--- When a stop breakpoint fires, pwdebug drops you into a REPL. The
+-- When a stop breakpoint fires, luaprobe drops you into a REPL. The
 -- most useful commands are:
 --
 --   c          continue
@@ -38,13 +38,13 @@
 -- Target stdout/stderr interleaves with this REPL on the same tty.
 -- For a cleaner experience, redirect the target's output:
 --
---   pwdebug -b foo.lua:42 foo.lua 2>/tmp/target.err >/tmp/target.out
+--   luaprobe -b foo.lua:42 foo.lua 2>/tmp/target.err >/tmp/target.out
 
--- Find the repo's pwdebug.lua regardless of where we're invoked from.
+-- Find the repo's luaprobe.lua regardless of where we're invoked from.
 local this_script = arg[0]
 local repo_dir = this_script:match("(.*/)")
 if not repo_dir or repo_dir == "" then repo_dir = "./" end
--- bin/pwdebug -> repo/
+-- bin/luaprobe -> repo/
 package.path = repo_dir .. "../?.lua;" .. repo_dir .. "?.lua;" .. package.path
 
 -- Force line-buffered stdout/stderr so our prompts and status lines
@@ -52,9 +52,9 @@ package.path = repo_dir .. "../?.lua;" .. repo_dir .. "?.lua;" .. package.path
 pcall(function() io.stdout:setvbuf("line") end)
 pcall(function() io.stderr:setvbuf("line") end)
 
-local ok_mod, pwdebug = pcall(require, "pwdebug")
+local ok_mod, luaprobe = pcall(require, "luaprobe")
 if not ok_mod then
-  io.stderr:write("pwdebug: could not load pwdebug.lua (" .. tostring(pwdebug) .. ")\n")
+  io.stderr:write("luaprobe: could not load luaprobe.lua (" .. tostring(luaprobe) .. ")\n")
   io.stderr:write("  looked in: " .. package.path .. "\n")
   os.exit(1)
 end
@@ -95,14 +95,14 @@ do
     if a == "-b" or a == "--break" then
       i = i + 1
       if not arg[i] then
-        io.stderr:write("pwdebug: --break needs an argument\n")
+        io.stderr:write("luaprobe: --break needs an argument\n")
         os.exit(2)
       end
       opts.breakpoints[#opts.breakpoints + 1] = arg[i]
     elseif a == "-s" or a == "--source" then
       i = i + 1
       if not arg[i] then
-        io.stderr:write("pwdebug: --source needs an argument\n")
+        io.stderr:write("luaprobe: --source needs an argument\n")
         os.exit(2)
       end
       opts.source_dirs[#opts.source_dirs + 1] = arg[i]
@@ -116,7 +116,7 @@ do
       print_help()
       os.exit(0)
     elseif a:sub(1, 1) == "-" then
-      io.stderr:write("pwdebug: unknown option " .. a .. "\n")
+      io.stderr:write("luaprobe: unknown option " .. a .. "\n")
       os.exit(2)
     else
       -- First positional is the target script; rest go to the target.
@@ -133,8 +133,8 @@ do
 end
 
 if not opts.target then
-  io.stderr:write("pwdebug: missing target script\n")
-  io.stderr:write("run `pwdebug --help` for usage\n")
+  io.stderr:write("luaprobe: missing target script\n")
+  io.stderr:write("run `luaprobe --help` for usage\n")
   os.exit(2)
 end
 if #opts.source_dirs == 0 then
@@ -150,25 +150,25 @@ local function abspath(p)
 end
 
 local stub_abs = opts.stub_path and abspath(opts.stub_path)
-               or abspath(repo_dir .. "../pwdebug_stub.lua")
-               or abspath(repo_dir .. "pwdebug_stub.lua")
+               or abspath(repo_dir .. "../luaprobe_stub.lua")
+               or abspath(repo_dir .. "luaprobe_stub.lua")
 if not stub_abs then
-  io.stderr:write("pwdebug: could not resolve stub path; use --stub PATH\n")
+  io.stderr:write("luaprobe: could not resolve stub path; use --stub PATH\n")
   os.exit(1)
 end
 
 -- ---------- start session ----------
 
-local sess, err = pwdebug.new({
+local sess, err = luaprobe.new({
   stub_path    = stub_abs,
   breakpoints  = opts.breakpoints,
   source_roots = opts.source_dirs,
   on_status    = function(msg)
-    io.stderr:write("[pwdebug] " .. msg .. "\n")
+    io.stderr:write("[luaprobe] " .. msg .. "\n")
   end,
 })
 if not sess then
-  io.stderr:write("pwdebug: could not create session: " .. tostring(err) .. "\n")
+  io.stderr:write("luaprobe: could not create session: " .. tostring(err) .. "\n")
   os.exit(1)
 end
 
@@ -186,11 +186,11 @@ local cmd = string.format(
   "sh -c '%s %s %s%s' &",
   sess:env_prefix(), opts.interp, shq(opts.target), target_args_str)
 
-io.write("pwdebug: launching: " .. opts.interp .. " " .. opts.target .. "\n")
+io.write("luaprobe: launching: " .. opts.interp .. " " .. opts.target .. "\n")
 for _, spec in ipairs(opts.breakpoints) do
-  io.write("pwdebug:   breakpoint: " .. spec .. "\n")
+  io.write("luaprobe:   breakpoint: " .. spec .. "\n")
 end
-io.write("pwdebug: waiting for events (Ctrl-C to quit)\n")
+io.write("luaprobe: waiting for events (Ctrl-C to quit)\n")
 os.execute(cmd)
 
 -- Trap Ctrl-C so we can clean up FIFOs on exit. Best-effort: LuaJIT
@@ -428,7 +428,7 @@ local function enter_repl(ev)
   io.write("\n")
   print_locals(ev)
   while true do
-    io.write("(pwdebug) ")
+    io.write("(luaprobe) ")
     io.flush()
     local input = io.read("*l")
     if not input then
@@ -452,7 +452,7 @@ while running do
   local evs = sess:poll()
   for _, ev in ipairs(evs) do
     if ev.event == "hello" then
-      io.write("pwdebug: child attached\n")
+      io.write("luaprobe: child attached\n")
     elseif ev.event == "break" then
       if ev.reason == "log" then
         io.write(string.format(
