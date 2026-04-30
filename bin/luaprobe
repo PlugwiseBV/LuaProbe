@@ -194,9 +194,36 @@ local target_args_str = ""
 for _, a in ipairs(opts.target_args) do
   target_args_str = target_args_str .. " " .. shq(a)
 end
+
+-- ---------- ffi setup ----------
+-- Loaded up front so the signal handler, kill_child, and the main
+-- loop's sleep all use direct C calls. `os.execute("sleep …")` is
+-- specifically avoided because POSIX system() temporarily sets
+-- SIGINT/SIGQUIT to SIG_IGN for the duration of waitpid — and our
+-- main loop spends ~all its time in that sleep, so a Ctrl-C
+-- delivered during the window would be silently dropped.
+local ffi = require("ffi")
+ffi.cdef[[
+  int kill(int pid, int sig);
+  int usleep(unsigned long usec);
+]]
+local C = ffi.C
+local SIGTERM = 15
+
+local function msleep(ms) C.usleep(ms * 1000) end
+
+-- ---------- spawn + capture PID ----------
+-- We need the child's PID so Ctrl-C / `q` can kill it. The trick:
+-- inside `sh -c`, run `<env> exec <interp> <target> & echo $! > FILE`.
+-- The `exec` replaces the inner sh with the lua interpreter
+-- *without* an extra fork, so $! (the bg job's PID) IS the lua
+-- PID. We poll the pidfile because os.execute returns before the
+-- bg sh has necessarily written it.
+local pidfile = string.format("/tmp/luaprobe-pid-%d-%d",
+  os.time(), math.random(1, 1000000000))
 local cmd = string.format(
-  "sh -c '%s %s %s%s' &",
-  sess:env_prefix(), opts.interp, shq(opts.target), target_args_str)
+  "sh -c '%s exec %s %s%s & echo $! > %s' &",
+  sess:env_prefix(), opts.interp, shq(opts.target), target_args_str, pidfile)
 
 io.write("luaprobe: launching: " .. opts.interp .. " " .. opts.target .. "\n")
 for _, spec in ipairs(opts.breakpoints) do
@@ -205,9 +232,48 @@ end
 io.write("luaprobe: waiting for events (Ctrl-C to quit)\n")
 os.execute(cmd)
 
--- Trap Ctrl-C so we can clean up FIFOs on exit. Best-effort: LuaJIT
--- doesn't expose signal(3) directly without ffi, so we just install
--- a fallback via pcall around the main loop.
+local child_pid
+for _ = 1, 100 do
+  local f = io.open(pidfile, "r")
+  if f then
+    local s = f:read("*l")
+    f:close()
+    if s and #s > 0 then
+      child_pid = tonumber(s)
+      if child_pid then break end
+    end
+  end
+  msleep(10)
+end
+os.remove(pidfile)
+if not child_pid then
+  io.stderr:write("luaprobe: warning: could not capture child PID; " ..
+    "Ctrl-C may not kill the target\n")
+end
+
+-- ---------- child cleanup ----------
+-- Without taking the child down on controller exit, hitting Ctrl-C
+-- exits the controller but leaves the spawned lua process
+-- orphaned (it's in the same pgroup but the FIFO it'll next try
+-- to write to is gone, so it'll only notice the next time it
+-- hits a breakpoint — meanwhile its stdout keeps churning).
+--
+-- We deliberately do NOT install an FFI-cast signal handler:
+-- LuaJIT's docs warn callbacks aren't safe in signal context, and
+-- in practice they panic with "bad callback" when a signal arrives
+-- during VM teardown. Instead we lean on LuaJIT's default SIGINT
+-- handler (which sets a debug hook so the next Lua line raises
+-- `interrupted!`), wrap the main loop in xpcall, and run cleanup
+-- on the way out. The crucial enabler is C.usleep instead of
+-- `os.execute("sleep …")`: the latter goes through libc system()
+-- which masks SIGINT for the duration of waitpid, so the signal
+-- would be silently swallowed in our main loop.
+local function kill_child()
+  if child_pid then
+    C.kill(child_pid, SIGTERM)
+    child_pid = nil
+  end
+end
 
 -- ---------- REPL helpers ----------
 
@@ -330,7 +396,7 @@ local function wait_for_event(event_name, timeout_ticks)
     for _, ev in ipairs(sess:poll()) do
       if ev.event == event_name then return ev end
     end
-    os.execute("sleep 0.02")
+    msleep(20)
   end
   return nil
 end
@@ -461,8 +527,9 @@ local function handle_command(input)
   elseif cmd == "bps" or cmd == "breakpoints" then
     print_bps()
   elseif cmd == "q" or cmd == "quit" or cmd == "exit" then
+    kill_child()
     sess:close()
-    os.execute("sleep 0.05")
+    msleep(50)
     os.exit(0)
   elseif cmd == "h" or cmd == "help" or cmd == "?" then
     io.write(HELP)
@@ -498,61 +565,75 @@ local function enter_repl(ev)
 end
 
 -- ---------- main loop ----------
+-- Wrapped in xpcall so any Lua-level error (or LuaJIT's
+-- SIGINT-via-debug-hook escape, in cases where the C signal
+-- handler above didn't catch it) still runs cleanup before the
+-- process exits.
 
-local running = true
-while running do
-  local evs = sess:poll()
-  for _, ev in ipairs(evs) do
-    if ev.event == "hello" then
-      io.write("luaprobe: child attached\n")
-    elseif ev.event == "break" then
-      if ev.reason == "log" then
-        local top_src = (ev.frames and ev.frames[1] and ev.frames[1].source) or "?"
-        io.write(string.format(
-          "\n[LOG] %s:%d  [%s]\n",
-          top_src, ev.line or 0,
-          ev.is_main and "main" or ("co:" .. tostring(ev.thread or ""):sub(-8))))
-        if ev.created_src then
-          io.write(string.format("    coroutine created at %s:%d\n",
-            ev.created_src, ev.created_line or 0))
-        end
-        for i, f in ipairs(ev.frames or {}) do
-          io.write(string.format("  #%d  %-24s %s:%d\n",
-            i, f.name or "?", f.source or "?", f.line or 0))
-        end
-        -- Top frame's locals/upvalues/entry, if the bp didn't opt out
-        -- of capturing them via [fields]. Each section is omitted
-        -- when its array is missing (filter said no) or empty.
-        local fv = ev.vars and ev.vars[1]
-        if fv then
-          if fv.locals and #fv.locals > 0 then
-            io.write("  locals:\n")
-            for _, v in ipairs(fv.locals) do
-              io.write(string.format("    %s = %s\n", v.name, v.value))
+local function run()
+  while true do
+    local evs = sess:poll()
+    for _, ev in ipairs(evs) do
+      if ev.event == "hello" then
+        io.write("luaprobe: child attached\n")
+      elseif ev.event == "break" then
+        if ev.reason == "log" then
+          local top_src = (ev.frames and ev.frames[1] and ev.frames[1].source) or "?"
+          io.write(string.format(
+            "\n[LOG] %s:%d  [%s]\n",
+            top_src, ev.line or 0,
+            ev.is_main and "main" or ("co:" .. tostring(ev.thread or ""):sub(-8))))
+          if ev.created_src then
+            io.write(string.format("    coroutine created at %s:%d\n",
+              ev.created_src, ev.created_line or 0))
+          end
+          for i, f in ipairs(ev.frames or {}) do
+            io.write(string.format("  #%d  %-24s %s:%d\n",
+              i, f.name or "?", f.source or "?", f.line or 0))
+          end
+          -- Top frame's locals/upvalues/entry, if the bp didn't opt
+          -- out of capturing them via [fields]. Each section is
+          -- omitted when its array is missing (filter said no) or
+          -- empty.
+          local fv = ev.vars and ev.vars[1]
+          if fv then
+            if fv.locals and #fv.locals > 0 then
+              io.write("  locals:\n")
+              for _, v in ipairs(fv.locals) do
+                io.write(string.format("    %s = %s\n", v.name, v.value))
+              end
+            end
+            if fv.upvalues and #fv.upvalues > 0 then
+              io.write("  upvalues:\n")
+              for _, v in ipairs(fv.upvalues) do
+                io.write(string.format("    %s = %s\n", v.name, v.value))
+              end
+            end
+            if fv.entry and #fv.entry > 0 then
+              io.write("  entry (values at function entry):\n")
+              for _, v in ipairs(fv.entry) do
+                io.write(string.format("    %s = %s\n", v.name, v.value))
+              end
             end
           end
-          if fv.upvalues and #fv.upvalues > 0 then
-            io.write("  upvalues:\n")
-            for _, v in ipairs(fv.upvalues) do
-              io.write(string.format("    %s = %s\n", v.name, v.value))
-            end
-          end
-          if fv.entry and #fv.entry > 0 then
-            io.write("  entry (values at function entry):\n")
-            for _, v in ipairs(fv.entry) do
-              io.write(string.format("    %s = %s\n", v.name, v.value))
-            end
-          end
+        else
+          enter_repl(ev)
         end
-      else
-        enter_repl(ev)
+      elseif ev.event == "error" then
+        io.stderr:write("stub error at " .. tostring(ev.where) ..
+          ": " .. tostring(ev.err) .. "\n")
       end
-    elseif ev.event == "error" then
-      io.stderr:write("stub error at " .. tostring(ev.where) ..
-        ": " .. tostring(ev.err) .. "\n")
     end
+    msleep(50)
   end
-  os.execute("sleep 0.05")
 end
 
-sess:close()
+local ok, err = xpcall(run, debug.traceback)
+kill_child()
+pcall(function() sess:close() end)
+if not ok then
+  if not tostring(err):match("interrupted") then
+    io.stderr:write("luaprobe: " .. tostring(err) .. "\n")
+    os.exit(1)
+  end
+end
