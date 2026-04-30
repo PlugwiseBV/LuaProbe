@@ -591,8 +591,13 @@ end
 -- MUST be declared before pause(), because pause() reads it.
 local co_creation = setmetatable({}, { __mode = "k" })
 
+-- STACK_LEVEL is given relative to the CALLER's POV (typically 2 =
+-- the user code that called coroutine.create / .wrap).  We add 1 to
+-- account for `capture_creation_site' itself sitting on the stack;
+-- without that bump we'd record the wrapper's `coroutine.create'
+-- redefinition site instead of the user's call site.
 local function capture_creation_site(co, stack_level)
-  local info = debug.getinfo(stack_level, "Sl")
+  local info = debug.getinfo(stack_level + 1, "Sl")
   if not info then return end
   local src = info.source or "?"
   if type(src) == "string" and src:sub(1, 1) == "@" then
@@ -602,6 +607,44 @@ local function capture_creation_site(co, stack_level)
     source = src,
     line   = info.currentline or 0,
   }
+end
+
+-- Walk co_creation, gather every live (non-dead) coroutine and the
+-- minimum useful info: status, creation site, top file:line.  Cheap
+-- enough to do on every pause; the weak table only ever holds
+-- coroutines user code has handed us via create/wrap.
+local function gather_live_coroutines(self_co)
+  local out = {}
+  for co, info in pairs(co_creation) do
+    if co ~= self_co then
+      local status = coroutine.status(co)
+      if status ~= "dead" then
+        local top = debug.getinfo(co, 0, "Sl")
+        local top_src, top_line
+        if top then
+          top_src = top.source or "?"
+          if type(top_src) == "string" and top_src:sub(1, 1) == "@" then
+            top_src = top_src:sub(2):gsub("^%./", "")
+          end
+          top_line = top.currentline or 0
+        end
+        out[#out + 1] = {
+          id           = tostring(co),
+          status       = status,
+          created_src  = info.source,
+          created_line = info.line,
+          top_src      = top_src,
+          top_line     = top_line,
+        }
+      end
+    end
+  end
+  -- Stable ordering: status group, then id.
+  table.sort(out, function(a, b)
+    if a.status ~= b.status then return a.status < b.status end
+    return a.id < b.id
+  end)
+  return out
 end
 
 local function pause(reason, line, frames, locals_by_frame)
@@ -641,6 +684,7 @@ local function pause(reason, line, frames, locals_by_frame)
       is_main        = co == nil,
       created_src    = creation and creation.source or nil,
       created_line   = creation and creation.line   or nil,
+      coroutines     = gather_live_coroutines(co),
     }
     trace("pause step 6: calling send")
     send(ev)

@@ -157,6 +157,7 @@ function M.new(opts)
   self.alive        = false
   self.frames       = {}
   self.vars         = {}
+  self.coroutines   = {}
   self.log_history  = {}
 
   if opts.breakpoints then
@@ -291,6 +292,7 @@ function Session:_update_from_event(ev)
     self.is_main      = ev.is_main
     self.created_src  = ev.created_src
     self.created_line = ev.created_line
+    self.coroutines   = ev.coroutines or {}
     if ev.reason == "log" then
       self.log_history[#self.log_history + 1] = ev
     else

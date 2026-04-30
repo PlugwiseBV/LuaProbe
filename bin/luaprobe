@@ -329,6 +329,26 @@ local function print_locals(ev)
   end
 end
 
+local function print_coroutines(ev)
+  local cos = ev and ev.coroutines or {}
+  if #cos == 0 then
+    io.write("  (no live coroutines)\n")
+    return
+  end
+  io.write(string.format("coroutines (%d live):\n", #cos))
+  for i, c in ipairs(cos) do
+    io.write(string.format("  #%-2d  %-9s  %s   created %s:%d",
+      i,
+      c.status or "?",
+      c.id or "?",
+      c.created_src or "?", c.created_line or 0))
+    if c.top_src then
+      io.write(string.format("   at %s:%d", c.top_src, c.top_line or 0))
+    end
+    io.write("\n")
+  end
+end
+
 local function print_source(ev, n)
   n = tonumber(n) or 10
   local f = ev.frames and ev.frames[current_frame_idx]
@@ -455,6 +475,8 @@ local function handle_command(input)
     print_source(current_break_ev, rest ~= "" and rest or nil)
   elseif cmd == "locals" then
     print_locals(current_break_ev)
+  elseif cmd == "co" or cmd == "coroutines" then
+    print_coroutines(current_break_ev)
   elseif cmd == "p" or cmd == "print" then
     if rest == "" then
       io.write("  usage: p <variable-name>\n")
@@ -546,6 +568,10 @@ local function enter_repl(ev)
   print_backtrace(ev)
   io.write("\n")
   print_locals(ev)
+  if ev.coroutines and #ev.coroutines > 0 then
+    io.write("\n")
+    print_coroutines(ev)
+  end
   while true do
     io.write("(luaprobe) ")
     io.flush()
