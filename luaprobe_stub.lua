@@ -57,8 +57,18 @@ trace("loaded; bps=" .. bps_env ..
 -- the nearest following statement, not on the literal line number.
 local bp_list = {}
 
+-- Match if the two paths are equal, or if one is a path-component
+-- suffix of the other. Bidirectional so an absolute bp like
+-- "/abs/foo/bar.lua" matches a relative src "foo/bar.lua" (and the
+-- reverse), which is the common case when an editor stores absolute
+-- paths but `LUA_PATH` resolves to a project-relative one at runtime.
 local function bp_path_matches(src, path)
-  return src == path or src:sub(-(#path + 1)) == "/" .. path
+  if src == path then return true end
+  if #src > #path then
+    return src:sub(-(#path + 1)) == "/" .. path
+  else
+    return path:sub(-(#src + 1)) == "/" .. src
+  end
 end
 
 -- Field set controls which optional parts of the break event get
